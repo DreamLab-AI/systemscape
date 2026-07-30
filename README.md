@@ -2,7 +2,7 @@
 
 **Scrolling 3D telemetry history for your terminal.**
 
-![thermal3d in action](docs/hero.gif)
+![thermal3d in action](./hero.gif)
 
 > Hero GIF pending — see [docs/HERO_GIF.md](docs/HERO_GIF.md) for capture notes and a ready-made VHS tape.
 
