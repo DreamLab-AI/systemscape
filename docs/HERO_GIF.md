@@ -1,6 +1,6 @@
 # Hero GIF — capture notes
 
-Intent: a ~25 s looping GIF for the README hero showing thermal3d in
+Intent: a ~25 s looping GIF for the README hero showing SystemScape in
 `--demo` mode doing one graceful partial rotation, so a first-time viewer
 sees (1) the six colour-coded walls, (2) the scrolling time axis, and
 (3) the depth stacking as the scene turns.
@@ -17,7 +17,7 @@ vhs docs/hero.tape
 ## Recipe B — asciinema + agg
 
 ```sh
-asciinema rec /tmp/t3d.cast -c "./target/release/thermal3d --demo" \
+asciinema rec /tmp/systemscape.cast -c "./target/release/systemscape --demo" \
   --cols 160 --rows 40   # let it run ~25 s, then Ctrl-C
 agg --font-size 14 --speed 1 /tmp/t3d.cast docs/hero.gif
 ```

@@ -1,21 +1,23 @@
-# thermal3d
+# SystemScape
 
 **Scrolling 3D telemetry history for your terminal.**
 
-![thermal3d in action](./hero.gif)
+![SystemScape in action](./hero.gif)
 
 > Hero GIF pending — see [docs/HERO_GIF.md](docs/HERO_GIF.md) for capture notes and a ready-made VHS tape.
 
-thermal3d renders host telemetry as a field of 3D histogram walls, drawn
+SystemScape renders host telemetry as a field of 3D histogram walls, drawn
 entirely with ANSI escape codes using
 [gemini-engine](https://github.com/renpenguin/gemini-engine) (the renderer
 behind [display3d](https://github.com/renpenguin/display3d)). Each telemetry
 class is a right-to-left scrolling wall of bars; walls are stacked into the
 depth axis and the whole scene rotates continuously through 360°, so a peak
-in one class can be visually lined up with its cause in another.
+in one class can be visually lined up with its cause in another. Aggregate
+disk and network throughput reveal whether heat and load came from compute,
+storage, or traffic.
 
 ```
- NOW  CPU↑39°  GPU↑52°  NVMe 28°  PCH 36°  NIC 30°  PWR 257W  LOAD 2%  MEM 13%
+ NOW  CPU↑39°  GPU↑52°  NVMe 28°  PWR 257W  LOAD 2%  MEM 13%  IO 824MB/s  NET 91MB/s
 ```
 
 ## Telemetry classes
@@ -28,6 +30,8 @@ in one class can be visually lined up with its cause in another.
 | PWR   | ACPI `power_meter` (whole-system watts) | — |
 | LOAD  | `/proc/stat` busy % | — |
 | MEM   | `/proc/meminfo` used % | — |
+| IO    | `/proc/diskstats`, aggregate physical-disk reads + writes | MB/s |
+| NET   | `/proc/net/dev`, aggregate RX + TX excluding loopback | MB/s |
 
 The NOW bar additionally reports PCH and NIC (`ixgbe`) temperatures.
 Missing sources degrade gracefully — a wall simply doesn't appear.
@@ -39,7 +43,8 @@ Missing sources degrade gracefully — a wall simply doesn't appear.
   commits the *maximum* seen in its 150 s slot, so short spikes survive
   decimation — the whole point of a correlation display.
 - **Colour = value**: thermals run blue→green→yellow→red, power runs
-  purple→pink, load/memory teal→white, all as 24-bit ANSI colour.
+  purple→pink, load/memory teal→white, throughput indigo→cyan→white,
+  all as 24-bit ANSI colour.
 - **Live resize**: the canvas follows the terminal size every frame.
 - **Cheap**: ~2 % of one core at 10 FPS.
 
@@ -47,8 +52,8 @@ Missing sources degrade gracefully — a wall simply doesn't appear.
 
 ```sh
 cargo build --release
-./target/release/thermal3d          # live telemetry
-./target/release/thermal3d --demo   # prefill 2 h of synthetic, correlated data
+./target/release/systemscape          # live telemetry
+./target/release/systemscape --demo   # prefill 2 h of synthetic, correlated data
 ```
 
 Requires Linux (`/sys/class/hwmon`, `/proc`) and a truecolour terminal.
@@ -62,8 +67,25 @@ useful for checking the full visual without waiting two hours.
 ## tmux integration
 
 ```sh
-tmux new-window -n Thermal 'while true; do /path/to/thermal3d; sleep 2; done'
+tmux new-window -n System 'while true; do /path/to/systemscape; sleep 2; done'
+tmux split-window -h -p 38 'btm --basic'
 ```
+
+The 3D pane answers “what moved together over time?” while the companion pane
+attributes the current event to processes, cores, disks, and interfaces.
+
+## Containers
+
+SystemScape is designed to work as an immutable image package. Run it inside
+the container so `/proc` reflects the container-visible system view. GPU
+telemetry requires `nvidia-smi` plus the NVIDIA runtime/device mapping;
+hardware temperatures depend on which `/sys/class/hwmon` entries the runtime
+exposes. Missing sources degrade gracefully. Disk and network rates derive
+from container-visible `/proc/diskstats` and `/proc/net/dev` counters.
+
+[DreamLab Agentbox](https://github.com/DreamLab-AI/agentbox) bakes SystemScape
+into its Nix-built runtime and uses it as the primary tmux System pane, with
+`btm` alongside for live attribution.
 
 ## Tuning
 

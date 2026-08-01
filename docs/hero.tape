@@ -8,7 +8,7 @@ Set Theme "Catppuccin Mocha"
 Set Framerate 12
 
 Hide
-Type "./target/release/thermal3d --demo"
+Type "./target/release/systemscape --demo"
 Enter
 Show
 
