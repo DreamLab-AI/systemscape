@@ -83,10 +83,10 @@ fn gradient(stops: &[(f64, (u8, u8, u8))], n: f64) -> Colour {
 
 #[derive(Clone, Copy)]
 enum Scale {
-    Thermal,    // blue → green → yellow → red
-    Power,      // deep purple → pink
-    Load,       // teal → cyan → white
-    Throughput, // indigo → cyan → white
+    Thermal,    // amber → orange → red
+    Power,      // coral → hot pink
+    Load,       // gold → orange → red
+    Throughput, // peach → coral → pink
 }
 
 impl Scale {
@@ -94,28 +94,26 @@ impl Scale {
         match self {
             Self::Thermal => gradient(
                 &[
-                    (0.00, (30, 90, 255)),
-                    (0.30, (10, 255, 100)),
-                    (0.55, (255, 210, 5)),
-                    (0.78, (255, 90, 5)),
-                    (1.00, (255, 25, 70)),
+                    (0.0, (255, 205, 65)),
+                    (0.5, (255, 130, 30)),
+                    (1.0, (255, 45, 55)),
                 ],
                 n,
             ),
-            Self::Power => gradient(&[(0.0, (100, 15, 220)), (1.0, (255, 35, 180))], n),
+            Self::Power => gradient(&[(0.0, (255, 150, 105)), (1.0, (255, 50, 140))], n),
             Self::Load => gradient(
                 &[
-                    (0.0, (5, 155, 105)),
-                    (0.6, (10, 255, 245)),
-                    (1.0, (240, 253, 250)),
+                    (0.0, (255, 225, 70)),
+                    (0.6, (255, 145, 25)),
+                    (1.0, (255, 65, 40)),
                 ],
                 n,
             ),
             Self::Throughput => gradient(
                 &[
-                    (0.0, (49, 46, 129)),
-                    (0.55, (6, 182, 212)),
-                    (1.0, (240, 249, 255)),
+                    (0.0, (255, 185, 120)),
+                    (0.55, (255, 110, 85)),
+                    (1.0, (255, 70, 130)),
                 ],
                 n,
             ),
@@ -560,7 +558,7 @@ fn black_panel(width: usize, height: usize, lines: &[String]) -> String {
     }
     let y = height - lines.len() - 2;
     let mut out = format!(
-        "\x1b[{y};3H\x1b[48;2;0;0;0m\x1b[38;2;90;230;255m+{}+",
+        "\x1b[{y};3H\x1b[48;2;0;0;0m\x1b[38;2;255;205;100m+{}+",
         "-".repeat(w - 2)
     );
     for (i, line) in lines.iter().enumerate() {

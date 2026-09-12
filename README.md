@@ -47,15 +47,16 @@ The view groups records by UTC day, then lays agents out in depth over a
 procedural island. Its glyph textures, coastline and relief provide a spatial
 frame; they do not encode work metrics. Prompt stems
 are taller than tool stems; height denotes record type, not cost or productivity.
-Green marks prompts, blue tools, rust errors and gold recorded commit receipts.
+Amber marks prompts, orange tools, red errors and gold recorded commit receipts;
+the selected record is cream.
 The default tour flies smoothly through a landscape six times wider and deeper
 than the original view. It completes a circuit in roughly fifty-two seconds,
 with a changing altitude of 30–46 world units and a moderately downward forward-looking camera.
-Tall neon gateways, information towers and varied glyph textures provide motion
+Tall pastel gateways, information towers and varied glyph textures provide motion
 and depth cues. Record selection advances every four seconds across pages,
 agent districts and days. Nearby objects carry floating labels; the selected action has a descriptive black panel.
-Telemetry uses the same textured neon terrain, flight path and opaque readings panel.
-Both views use 24-bit RGB shading with dark valleys and saturated highlights. Navigation
+Telemetry uses the same textured pastel terrain, flight path and opaque readings panel.
+Both views use 24-bit RGB shading with muted pastel terrain and vivid warm data highlights. Navigation
 keys pause the tour; Space resumes it. Select a record to inspect its project,
 session and source file. Lines describe
 temporal grouping within sessions, not proven causal dependencies or git ancestry.
@@ -136,8 +137,8 @@ Missing sources degrade gracefully — a wall simply doesn't appear.
 - **Peak-hold downsampling**: sensors are polled every 2 s and each bar
   commits the *maximum* seen in its 150 s slot, so short spikes survive
   decimation — the whole point of a correlation display.
-- **Colour = value**: thermals run blue→green→yellow→red, power runs
-  purple→pink, load/memory teal→white, throughput indigo→cyan→white,
+- **Colour = value**: thermals run amber→orange→red, power runs
+  coral→pink, load/memory gold→orange→red, throughput peach→coral→pink,
   all as 24-bit ANSI colour.
 - **Live resize**: the canvas follows the terminal size every frame.
 - **Render rate**: telemetry targets 18 FPS; CPU usage depends on pane size and sensor tools.

@@ -170,11 +170,11 @@ fn dolly(state: &mut State, factor: f64) {
 
 fn colour(kind: &str) -> Colour {
     match kind {
-        "prompt" => Colour::rgb(20, 255, 190),
-        "failure" => Colour::rgb(255, 65, 150),
+        "prompt" => Colour::rgb(255, 160, 35),
+        "failure" => Colour::rgb(255, 55, 75),
         "receipt" => Colour::rgb(255, 225, 40),
-        "tool" => Colour::rgb(45, 185, 255),
-        _ => Colour::rgb(195, 80, 255),
+        "tool" => Colour::rgb(255, 105, 45),
+        _ => Colour::rgb(255, 110, 155),
     }
 }
 
@@ -225,21 +225,20 @@ pub(crate) fn terrain(lanes: usize) -> Mesh3D {
             };
             let district = ((z / depth + 1.0) * 2.5) as usize;
             let palettes = [
-                (8, 245, 225),
-                (185, 25, 255),
-                (18, 255, 92),
-                (255, 152, 12),
-                (35, 105, 255),
-                (255, 28, 145),
+                (145, 180, 174),
+                (173, 158, 191),
+                (153, 180, 153),
+                (188, 178, 153),
+                (148, 168, 193),
+                (188, 159, 176),
             ];
             let (r, g, b) = if coast {
-                (24, 155, 255)
+                (143, 171, 190)
             } else {
                 palettes[district.min(5)]
             };
-            // Wide luminance range supplies shaded valleys and emissive ridges,
-            // using full RGB rather than washing every glyph towards white.
-            let shade = 0.26 + 0.74 * (noise as f64 / 10.0).powf(0.7);
+            // Muted pastel relief stays behind the vivid warm data objects.
+            let shade = 0.40 + 0.38 * (noise as f64 / 10.0).powf(0.7);
             let colour = Colour::rgb(
                 (r as f64 * shade) as u8,
                 (g as f64 * shade) as u8,
@@ -284,7 +283,7 @@ fn position(data: &Slice<'_>, index: usize) -> Vec3D {
 
 fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
     let mut mesh = terrain(data.lanes.len());
-    let rail = Colour::rgb(48, 125, 148);
+    let rail = Colour::rgb(110, 137, 145);
     for (i, _) in data.lanes.iter().enumerate() {
         let z = lane_z(i, data.lanes.len());
         let f = mesh.faces.len();
@@ -294,12 +293,28 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
         // make camera motion legible even where recorded actions are sparse.
         for x in [-9.5, 9.5] {
             let f = mesh.faces.len();
-            push_bar(&mut mesh, x, z - 0.8, 0.10, 0.10, 6.0, colour("tool"));
-            push_bar(&mut mesh, x, z + 0.8, 0.10, 0.10, 6.0, colour("event"));
+            push_bar(
+                &mut mesh,
+                x,
+                z - 0.8,
+                0.10,
+                0.10,
+                6.0,
+                Colour::rgb(133, 155, 168),
+            );
+            push_bar(
+                &mut mesh,
+                x,
+                z + 0.8,
+                0.10,
+                0.10,
+                6.0,
+                Colour::rgb(153, 138, 166),
+            );
             texture(&mut mesh, f, '#');
             let v = mesh.vertices.len();
             let f = mesh.faces.len();
-            push_bar(&mut mesh, x, z, 0.10, 0.9, 0.22, colour("prompt"));
+            push_bar(&mut mesh, x, z, 0.10, 0.9, 0.22, Colour::rgb(139, 163, 148));
             for vertex in &mut mesh.vertices[v..] {
                 vertex.y += 6.0;
             }
@@ -329,7 +344,7 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
         }
         let y = if e.kind == "prompt" { 5.5 } else { 2.8 };
         let col = if i == selected {
-            Colour::rgb(255, 255, 255)
+            Colour::rgb(255, 244, 185)
         } else {
             colour(&e.kind)
         };
@@ -777,7 +792,7 @@ fn render(
         &mut view,
         1,
         3,
-        "Green prompt · blue tool · rust error · gold commit receipt · white selected",
+        "Amber prompt · orange tool · red error · gold receipt · cream selected",
         muted,
     );
     // Clear footer cells after 3D projection so text remains readable at all angles.
