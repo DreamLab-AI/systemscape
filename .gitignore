@@ -1,1 +1,4 @@
 /target
+/.agentic-qe/
+/.claude-flow/
+/.deepsec-gate/

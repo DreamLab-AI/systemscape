@@ -19,6 +19,35 @@ use std::collections::VecDeque;
 use std::fs;
 use std::process::Command;
 use std::time::Instant;
+mod activity;
+mod activity_data;
+
+/// Restore terminal state on normal exit, errors and unwinding.
+struct Terminal;
+impl Terminal {
+    fn enter() -> std::io::Result<Self> {
+        use crossterm::{
+            cursor::Hide,
+            execute,
+            terminal::{enable_raw_mode, EnterAlternateScreen},
+        };
+        enable_raw_mode()?;
+        let guard = Self;
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
+        Ok(guard)
+    }
+}
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        use crossterm::{
+            cursor::Show,
+            execute,
+            terminal::{disable_raw_mode, LeaveAlternateScreen},
+        };
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+    }
+}
 
 const FPS: f32 = 10.0;
 const FOV: f64 = 60.0;
@@ -289,8 +318,10 @@ fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState) -> Snapshot {
                 let total: u64 = f.iter().sum();
                 let idle = f[3] + f[4];
                 let (pt, pi) = *prev_cpu;
-                if pt > 0 && total > pt {
-                    s.cpu_pct = Some(100.0 * (1.0 - (idle - pi) as f64 / (total - pt) as f64));
+                if pt > 0 && total > pt && idle >= pi {
+                    s.cpu_pct = Some(
+                        100.0 * (1.0 - (idle - pi) as f64 / (total - pt) as f64).clamp(0.0, 1.0),
+                    );
                 }
                 *prev_cpu = (total, idle);
             }
@@ -518,19 +549,37 @@ fn make_view(dims: (usize, usize)) -> View {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("systemscape {}\n\nUsage: systemscape [--demo]\n\n  --demo     prefill two hours of correlated synthetic telemetry\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
+        println!("systemscape {}\n\nUsage: systemscape [--demo]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: eight 3D history walls. Space pauses spin; arrows rotate; q quits.\nActivity: continuous flying tour of local work, 4 FPS. Navigation pauses it.\n          Arrows rotate/tilt, +/- zoom, j/k select, [/] day, Tab agent lanes,\n          PgUp/PgDn records, Enter source, f flat view, Space resumes tour, q quits.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("systemscape {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if args.iter().any(|a| a == "--activity") {
+        if let Err(error) = activity::run(&args) {
+            eprintln!("systemscape: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(arg) = args.iter().skip(1).find(|a| a.as_str() != "--demo") {
+        eprintln!("systemscape: unknown telemetry option {arg}; see --help");
+        std::process::exit(2);
+    }
+    let _terminal = match Terminal::enter() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("systemscape: {error}");
+            return;
+        }
+    };
     let mut dims = term_dims();
     let mut view = make_view(dims);
 
     let mut viewport = Viewport::new(
         Transform3D::look_at_lh(
-            Vec3D::new(0.0, 9.5, 27.0),
+            Vec3D::new(0.0, 18.0, 43.0),
             Vec3D::new(0.0, 1.3, 0.0),
             Vec3D::NEG_Y,
         ),
@@ -565,10 +614,28 @@ fn main() {
     poll_into_channels(&mut channels, &snap);
 
     let mut theta: f64 = 0.0;
+    let mut spin = true;
     let mut frame: u64 = 0;
     let slot_frames = (SLOT_SECS * f64::from(FPS)) as u64; // frames per history bar
 
     loop {
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+        if event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind != KeyEventKind::Release {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return
+                        }
+                        KeyCode::Char(' ') => spin = !spin,
+                        KeyCode::Left => theta -= 0.12,
+                        KeyCode::Right => theta += 0.12,
+                        _ => (),
+                    }
+                }
+            }
+        }
         // Follow pane resizes: rebuild the canvas and re-centre the camera,
         // then wipe the terminal so stale glyphs outside the new frame vanish.
         let now_dims = term_dims();
@@ -579,11 +646,11 @@ fn main() {
             print!("\x1b[2J");
         }
 
-        if frame > 0 && frame % u64::from(POLL_FRAMES) == 0 {
+        if frame > 0 && frame.is_multiple_of(u64::from(POLL_FRAMES)) {
             snap = poll_sensors(&mut prev_cpu, &mut rates);
             poll_into_channels(&mut channels, &snap);
         }
-        if frame > 0 && frame % slot_frames == 0 {
+        if frame > 0 && frame.is_multiple_of(slot_frames) {
             for ch in &mut channels {
                 ch.commit_slot();
             }
@@ -591,7 +658,9 @@ fn main() {
         }
         let scroll = (frame % slot_frames) as f64 / slot_frames as f64;
         frame = frame.wrapping_add(1);
-        theta = (theta + SPIN) % std::f64::consts::TAU;
+        if spin {
+            theta = (theta + SPIN) % std::f64::consts::TAU;
+        }
 
         let scene = build_scene(&channels, scroll);
         viewport.objects = vec![scene.with_transform(Transform3D::from_rotation_y(theta))];

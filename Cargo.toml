@@ -1,11 +1,19 @@
 [package]
 name = "systemscape"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Interactive 3D system telemetry and agent work history in the terminal"
+license = "Apache-2.0"
+repository = "https://github.com/DreamLab-AI/systemscape"
 
 [dependencies]
 gemini-engine = "1.2"
 terminal_size = "0.4"
+crossterm = "0.29"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+walkdir = "2"
 
 [profile.release]
 strip = true
