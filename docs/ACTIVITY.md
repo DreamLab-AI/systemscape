@@ -48,9 +48,12 @@ cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
+python3 scripts/terminal-smoke.py
 ```
 
 Regression tests cover partial appends, replay, rotations and rewrites, numeric
 archive identities, pending-file disclosure, invalid shapes, control filtering,
 subagent discovery, metadata preservation across a bounded tail, scene limits and
-small terminals. [Screenshot capture](SCREENSHOTS.md) exercises both live terminal modes.
+small terminals. The terminal smoke test exercises the continuous tour, manual
+pause/resume, source details, flat mode, resize and exit in an isolated tmux server.
+[Screenshot capture](SCREENSHOTS.md) exercises both live terminal modes.

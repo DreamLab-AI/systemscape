@@ -173,12 +173,87 @@ fn seconds(at: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
+/// Decorative terrain gives the time paths a shared spatial frame. Its relief
+/// is deterministic and does not pretend to encode throughput or task success.
+fn terrain(lanes: usize) -> Mesh3D {
     let mut mesh = Mesh3D::new(Vec::new(), Vec::new());
-    let rail = Colour::rgb(48, 65, 89);
+    let depth = (lanes as f64 * 1.5 + 2.0).max(5.5);
+    let (nx, nz) = (36usize, 24usize);
+    for j in 0..=nz {
+        for i in 0..=nx {
+            let x = -12.0 + 24.0 * i as f64 / nx as f64;
+            let z = -depth + 2.0 * depth * j as f64 / nz as f64;
+            let relief = (x * 0.52).sin() * (z * 0.73).cos() * 0.30;
+            let coast = (x / 12.0).powi(4) + (z / depth).powi(4);
+            let y = -0.85 + relief - coast * 0.55;
+            mesh.vertices.push(Vec3D::new(x, y, z));
+        }
+    }
+    for j in 0..nz {
+        for i in 0..nx {
+            let x = -12.0 + 24.0 * (i as f64 + 0.5) / nx as f64;
+            let z = -depth + 2.0 * depth * (j as f64 + 0.5) / nz as f64;
+            let radius = (x / 12.0).powi(4) + (z / depth).powi(4);
+            if radius > 1.0 + 0.12 * (x * 2.0 + z).sin() {
+                continue;
+            }
+            let noise = ((i * 17 + j * 31 + i * j * 7) % 11) as u8;
+            let coast = radius > 0.72;
+            let glyph = if coast {
+                ['~', ':', '.'][noise as usize % 3]
+            } else {
+                ['.', ':', '+', '*', '=', '.', ':', '+', '^', '.', '*'][noise as usize]
+            };
+            let colour = if coast {
+                Colour::rgb(31 + noise * 2, 69 + noise * 3, 128 + noise * 5)
+            } else {
+                Colour::rgb(22 + noise * 2, 72 + noise * 5, 135 + noise * 7)
+            };
+            let n = j * (nx + 1) + i;
+            mesh.faces.push(crate::Face::new(
+                vec![n + 1, n + nx + 2, n + nx + 1, n],
+                crate::ColChar::new(glyph, Modifier::Colour(colour)),
+            ));
+        }
+    }
+    mesh
+}
+
+fn texture(mesh: &mut Mesh3D, start: usize, glyph: char) {
+    for (index, face) in mesh.faces[start..].iter_mut().enumerate() {
+        face.fill_char.text_char = if index % 5 == 4 { glyph } else { ':' };
+    }
+}
+
+fn position(data: &Slice<'_>, index: usize) -> Vec3D {
+    let record = data.records[index];
+    let first = data.records.first().map_or(0.0, |e| seconds(&e.at));
+    let last = data.records.last().map_or(first, |e| seconds(&e.at));
+    let x = if last > first {
+        8.5 - 17.0 * (seconds(&record.at) - first) / (last - first)
+    } else {
+        0.0
+    };
+    let lane = data
+        .lanes
+        .iter()
+        .position(|a| a == &record.agent)
+        .unwrap_or(0);
+    Vec3D::new(
+        x,
+        if record.kind == "prompt" { 2.2 } else { 1.3 },
+        lane_z(lane, data.lanes.len()),
+    )
+}
+
+fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
+    let mut mesh = terrain(data.lanes.len());
+    let rail = Colour::rgb(48, 125, 148);
     for (i, _) in data.lanes.iter().enumerate() {
         let z = lane_z(i, data.lanes.len());
+        let f = mesh.faces.len();
         push_bar(&mut mesh, 0.0, z, 9.0, 0.045, 0.06, rail);
+        texture(&mut mesh, f, '=');
         node(&mut mesh, Vec3D::new(-9.0, 0.0, z), 0.17, rail);
     }
     let first = data.records.first().map_or(0.0, |e| seconds(&e.at));
@@ -202,11 +277,7 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
         } else {
             branch.1 += 1;
         }
-        let y = if e.kind == "prompt" {
-            1.5
-        } else {
-            0.4 + (branch.1 % 5) as f64 * 0.20
-        };
+        let y = if e.kind == "prompt" { 2.2 } else { 1.3 };
         let col = if i == selected {
             Colour::rgb(255, 255, 255)
         } else {
@@ -214,12 +285,26 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
         };
         // Stem connects each record to its agent's time rail. Prompt stems are
         // taller; record height is a category, never an invented cost metric.
-        push_bar(&mut mesh, x, z, 0.022, 0.022, y, col);
+        let f = mesh.faces.len();
+        push_bar(&mut mesh, x, z, 0.035, 0.035, y, col);
+        texture(&mut mesh, f, '|');
+        let f = mesh.faces.len();
         node(
             &mut mesh,
             Vec3D::new(x, y, z),
-            if i == selected { 0.20 } else { 0.12 },
+            if i == selected { 0.28 } else { 0.18 },
             col,
+        );
+        texture(
+            &mut mesh,
+            f,
+            match e.kind.as_str() {
+                "prompt" => '@',
+                "failure" => '!',
+                "receipt" => '*',
+                "tool" => '+',
+                _ => '#',
+            },
         );
         if e.kind != "prompt" && x < branch.0 {
             let start = mesh.vertices.len();
@@ -235,6 +320,8 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
             for v in &mut mesh.vertices[start..] {
                 v.y += 0.25;
             }
+            let f = mesh.faces.len().saturating_sub(5);
+            texture(&mut mesh, f, '-');
         }
     }
     mesh
@@ -291,6 +378,29 @@ fn render(
     let muted = Colour::rgb(126, 144, 164);
     let bright = Colour::rgb(204, 219, 235);
     let footer = dims.1.saturating_sub(7) as i64;
+    let sidebar = if dims.0 >= 110 && !state.flat && dims.1 >= 25 {
+        25i64
+    } else {
+        0
+    };
+    // A quiet glyph field supplies depth outside the island without resembling
+    // additional events. World terrain and event geometry are projected over it.
+    if !state.flat && dims.0 >= 80 && dims.1 >= 25 {
+        for y in 4..footer {
+            for x in 1..dims.0 as i64 - 1 {
+                let noise = (x * 73 + y * 151 + x * y * 7) % 97;
+                if noise < 8 {
+                    label(
+                        &mut view,
+                        x,
+                        y,
+                        &['.', ':', '~', '+', '.', ':', '*', '.'][noise as usize].to_string(),
+                        Colour::rgb(28, 27, 57),
+                    );
+                }
+            }
+        }
+    }
     if state.flat || dims.0 < 80 || dims.1 < 25 {
         let offset = state
             .selected
@@ -320,17 +430,50 @@ fn render(
     } else {
         let mut viewport = Viewport::new(
             Transform3D::look_at_lh(
-                state.focus + Vec3D::new(state.camera_x, 28.0 + state.pitch, state.zoom),
+                state.focus
+                    + Vec3D::new(
+                        state.camera_x,
+                        (28.0 + state.pitch) * if sidebar > 0 { 1.18 } else { 1.0 },
+                        state.zoom * if sidebar > 0 { 1.18 } else { 1.0 },
+                    ),
                 state.focus + Vec3D::new(0.0, 0.5, 0.0),
                 Vec3D::NEG_Y,
             ),
             60.0,
-            Vec2D::new(dims.0 as i64 / 2, (footer + 4) / 2),
+            Vec2D::new((dims.0 as i64 + sidebar) / 2, (footer + 4) / 2),
         );
         viewport.display_mode = DisplayMode::Solid;
         let rotation = Transform3D::from_rotation_y(state.yaw);
         viewport.objects = vec![scene(&data, state.selected).with_transform(rotation)];
         view.draw(&viewport);
+        if let Some(record) = data.records.get(state.selected) {
+            let p = project(
+                &viewport,
+                rotation,
+                position(&data, state.selected) + Vec3D::new(0.0, 0.7, 0.0),
+            );
+            if p.x > sidebar && p.y > 5 && p.y < footer - 1 {
+                label(
+                    &mut view,
+                    p.x - 2,
+                    p.y - 1,
+                    ". * .",
+                    Colour::rgb(97, 107, 83),
+                );
+                label(&mut view, p.x - 2, p.y, "[ @ ]", Colour::rgb(255, 242, 158));
+                label(
+                    &mut view,
+                    p.x + 4,
+                    p.y,
+                    &format!(
+                        "{} {}",
+                        record.kind.to_uppercase(),
+                        record.at.get(11..16).unwrap_or("")
+                    ),
+                    Colour::rgb(248, 218, 106),
+                );
+            }
+        }
         for (i, lane) in data.lanes.iter().enumerate() {
             let p = project(
                 &viewport,
@@ -338,7 +481,11 @@ fn render(
                 Vec3D::new(9.0, 0.2, lane_z(i, data.lanes.len())),
             );
             if p.x >= 0 && p.y > 3 && p.y < footer {
-                let name = format!("{} {}", i + 1, lane.chars().take(18).collect::<String>());
+                let name = if sidebar > 0 {
+                    format!("[{}]", i + 1)
+                } else {
+                    format!("{} {}", i + 1, lane.chars().take(18).collect::<String>())
+                };
                 label(
                     &mut view,
                     (p.x - name.chars().count() as i64 - 1).max(0),
@@ -348,6 +495,62 @@ fn render(
                 );
             }
         }
+    }
+    if sidebar > 0 {
+        for y in 4..footer {
+            label(&mut view, 0, y, &" ".repeat(sidebar as usize), muted);
+        }
+        label(
+            &mut view,
+            1,
+            5,
+            "+-- AGENT DISTRICTS --+",
+            Colour::rgb(240, 204, 82),
+        );
+        for (i, lane) in data.lanes.iter().enumerate() {
+            let y = 7 + i as i64 * 2;
+            if y + 1 >= footer - 3 {
+                break;
+            }
+            let active = data
+                .records
+                .get(state.selected)
+                .is_some_and(|e| &e.agent == lane);
+            let title = format!("{}{} {}", if active { ">" } else { " " }, i + 1, lane);
+            label(
+                &mut view,
+                1,
+                y,
+                &title.chars().take(23).collect::<String>(),
+                if active {
+                    Colour::rgb(123, 255, 203)
+                } else {
+                    muted
+                },
+            );
+            let count = data.records.iter().filter(|e| &e.agent == lane).count();
+            label(
+                &mut view,
+                3,
+                y + 1,
+                &format!("{count} actions in view"),
+                Colour::rgb(56, 115, 151),
+            );
+        }
+        label(
+            &mut view,
+            1,
+            footer - 3,
+            "@ prompt   + tool",
+            Colour::rgb(79, 190, 182),
+        );
+        label(
+            &mut view,
+            1,
+            footer - 2,
+            "! error    * receipt",
+            Colour::rgb(233, 173, 100),
+        );
     }
     label(
         &mut view,

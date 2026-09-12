@@ -12,8 +12,9 @@ The repository was previously named `thermal3d`; the binary remains `systemscape
 These are captures of the running application in 120×40 tmux panes. Activity
 uses synthetic records; telemetry uses a synthetic history with live NOW readings.
 
-**Agent work in 3D** — time runs along the rails, agents occupy separate lanes,
-and the selected record appears in white with its details below.
+**Agent work in 3D** — a textured ASCII island holds time paths and agent
+districts. Coloured beacons mark recorded actions; the selected record has a
+bright callout and its details below.
 
 ![3D agent work landscape with three agent lanes and a selected record](docs/activity-3d.png)
 
@@ -42,7 +43,9 @@ subagents and Agentbox profiles. It also reads Agentbox's shared event archive,
 so any agent that emits there can appear, regardless of its harness. Agents
 without a readable transcript or archived event are not visible.
 
-The view groups records by UTC day, then lays agents out in depth. Prompt stems
+The view groups records by UTC day, then lays agents out in depth over a
+procedural island. Its glyph textures, coastline and relief provide a spatial
+frame; they do not encode work metrics. Prompt stems
 are taller than tool stems; height denotes record type, not cost or productivity.
 Green marks prompts, blue tools, rust errors and gold recorded commit receipts.
 The default flying tour sweeps the camera through the landscape and selects a
