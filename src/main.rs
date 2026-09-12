@@ -54,6 +54,7 @@ const POLL_FRAMES: u32 = 36; // sensor poll every 2s
 const SLOT_SECS: f64 = 150.0; // one history bar per 150s
 const HISTORY: usize = 48; // 48 × 150s = 2h end to end
 const DX: f64 = 0.42; // time-axis spacing
+const STAT_RELIEF: f64 = 8.4; // 3x vertical exaggeration; normalised values remain linear
 const ROW_GAP: f64 = 1.3; // depth spacing between class walls
 const SPIN: f64 = 0.12 / 18.0; // same ~52s circuit as activity
 
@@ -427,7 +428,7 @@ fn build_scene(channels: &[Channel], scroll: f64) -> Mesh3D {
                 z,
                 0.17,
                 0.28,
-                0.15 + n * 2.8,
+                0.15 + n * STAT_RELIEF,
                 ch.scale.colour(n),
             );
         }
@@ -440,7 +441,7 @@ fn build_scene(channels: &[Channel], scroll: f64) -> Mesh3D {
                 z,
                 0.17,
                 0.28,
-                0.15 + n * 2.8,
+                0.15 + n * STAT_RELIEF,
                 ch.scale.colour(n),
             );
         }

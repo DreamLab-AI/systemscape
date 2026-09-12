@@ -137,6 +137,8 @@ Missing sources degrade gracefully — a wall simply doesn't appear.
 - **Peak-hold downsampling**: sensors are polled every 2 s and each bar
   commits the *maximum* seen in its 150 s slot, so short spikes survive
   decimation — the whole point of a correlation display.
+- **Vertical relief**: telemetry bars use 3× height exaggeration to expose peaks above
+  the terrain. Height remains linear in each channel’s normalised value.
 - **Colour = value**: thermals run amber→orange→red, power runs
   coral→pink, load/memory gold→orange→red, throughput peach→coral→pink,
   all as 24-bit ANSI colour.
@@ -194,6 +196,7 @@ Telemetry settings are constants at the top of `src/main.rs`:
 |----------|---------|---------|
 | `SLOT_SECS` | seconds per history bar (window = 48 × this) | 150 (2 h) |
 | `HISTORY` | bars per wall | 48 |
+| `STAT_RELIEF` | normalised bar height before world scaling | 8.4 |
 | `SPIN` | flight speed, rad/frame | 0.12 / 18 (~52 s/rev) |
 | `POLL_FRAMES` | frames between sensor polls | 36 (2 s) |
 | `FPS` | render rate | 18 |
