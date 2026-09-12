@@ -51,7 +51,9 @@ def raster(raw, destination):
 
 try:
     tmux('new-session', '-d', '-s', 'capture', '-x', '200', '-y', '65', f'{binary} --activity --demo')
-    time.sleep(0.6)
+    time.sleep(1.0)
+    tmux('send-keys', '-t', 'capture:0', 'Space')
+    time.sleep(0.4)
     for name, key in [('activity-3d', None), ('activity-flat', 'f')]:
         if key:
             tmux('send-keys', '-t', 'capture:0', key)

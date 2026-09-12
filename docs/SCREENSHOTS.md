@@ -1,7 +1,7 @@
 # Reproducing the README screenshots
 
 The README PNGs are rasterisations of ANSI cells captured from real 200×65 tmux
-panes. They are not concept art. Activity uses `--demo`; telemetry uses `--demo`
+panes. The activity tour is paused for each complete capture. They are not concept art. Activity uses `--demo`; telemetry uses `--demo`
 for its history and still polls the local system for its NOW bar.
 
 ```sh

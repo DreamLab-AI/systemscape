@@ -972,7 +972,10 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 ),
                 demo,
             );
-            view.display_render()?;
+            // Build and publish a whole frame atomically to terminals supporting
+            // synchronized updates (including tmux), avoiding half-painted terrain.
+            let frame = format!("\x1b[?2026h{view}\x1b[?2026l");
+            io::stdout().write_all(frame.as_bytes())?;
             io::stdout().flush()?;
             dirty = false;
         }
