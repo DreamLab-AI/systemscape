@@ -23,6 +23,7 @@ try:
     time.sleep(0.5)
     first = capture()
     assert 'FLYING TOUR' in first
+    assert '[ + ]' in first, 'centre reticule missing'
     time.sleep(1.2)
     assert capture() != first, 'tour camera did not move'
     tmux('send-keys', '-t', 'test:0', 'Left')

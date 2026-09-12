@@ -7,7 +7,7 @@ use crate::{
 };
 use crossterm::event::{self, Event as Input, KeyCode, KeyEventKind, KeyModifiers};
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,7 @@ struct State {
     detail: bool,
     districts: bool,
     hud: bool,
+    aimed: Option<usize>,
 }
 
 struct Slice<'a> {
@@ -505,6 +506,7 @@ fn render(
     demo: bool,
 ) -> View {
     let data = slice(events, state);
+    state.aimed = None;
     let mut view = make_view(dims);
     let muted = Colour::rgb(126, 144, 164);
     let bright = Colour::rgb(204, 219, 235);
@@ -582,6 +584,28 @@ fn render(
             dims,
         )];
         view.draw(&viewport);
+        // Pick the closest projected action touching the small centre aperture.
+        // Depth breaks ties where several objects overlap the sight.
+        let centre = Vec2D::new(dims.0 as i64 / 2, dims.1 as i64 / 2);
+        state.aimed = data
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(i, _)| {
+                let pos = world(position(&data, i));
+                let camera = viewport
+                    .camera_transform
+                    .mul_mat4(&rotation)
+                    .transform_point3(pos);
+                if camera.z <= 2.0 {
+                    return None;
+                }
+                let p = project(&viewport, rotation, pos);
+                ((p.x - centre.x).abs() <= 5 && (p.y - centre.y).abs() <= 2)
+                    .then_some((i, camera.z))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i);
         let mut labelled: Vec<Vec2D> = Vec::new();
         let mut candidates: Vec<_> = data
             .records
@@ -962,6 +986,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let _terminal = crate::Terminal::enter()?;
     let mut next_poll = Instant::now() + POLL;
     let mut dirty = true;
+    let mut buffer = crate::FrameBuffer::default();
     let mut last_frame = Instant::now();
     loop {
         if !demo && Instant::now() >= next_poll {
@@ -993,24 +1018,29 @@ pub fn run(args: &[String]) -> io::Result<()> {
             // Build and publish a whole frame atomically to terminals supporting
             // synchronized updates (including tmux), avoiding half-painted terrain.
             let data = slice(&events, &mut state);
-            let panel = data
-                .records
-                .get(state.selected)
-                .filter(|_| !state.hud && !state.flat && view.width >= 80 && view.height >= 25)
-                .map(|e| {
-                    crate::black_panel(
-                        view.width,
-                        view.height,
-                        &[
-                            format!("{} · {} · {}", e.agent, e.kind.to_uppercase(), e.at),
-                            e.text.clone(),
-                        ],
-                    )
-                })
-                .unwrap_or_default();
-            let frame = format!("\x1b[?2026h{view}{panel}\x1b[?2026l");
-            io::stdout().write_all(frame.as_bytes())?;
-            io::stdout().flush()?;
+            let panel = if !state.hud && !state.flat && view.width >= 40 && view.height >= 15 {
+                let w = view.width.saturating_sub(4).min(76);
+                let sight = format!("{}[ + ]", " ".repeat((w - 9) / 2));
+                let lines = if let Some(e) = state.aimed.and_then(|i| data.records.get(i)) {
+                    vec![
+                        sight,
+                        format!("{} · {}", e.agent, e.kind.to_uppercase()),
+                        e.text.clone(),
+                        format!("{} · Enter source", e.at),
+                    ]
+                } else {
+                    vec![
+                        sight,
+                        "No action in sight".into(),
+                        "Aim at a beacon · arrows steer · Space pause".into(),
+                        "Terrain and gateways are scenery".into(),
+                    ]
+                };
+                crate::panel_at((view.width - w) / 2 + 1, view.height / 2, w, &lines)
+            } else {
+                String::new()
+            };
+            buffer.present(&view, &panel)?;
             dirty = false;
         }
         if !event::poll(Duration::from_millis(FRAME_MS))? {
@@ -1075,6 +1105,9 @@ pub fn run(args: &[String]) -> io::Result<()> {
                     KeyCode::Char('f') => state.flat = !state.flat,
                     KeyCode::Char('h') => state.districts = !state.districts,
                     KeyCode::Enter => {
+                        if let Some(i) = state.aimed {
+                            state.selected = i;
+                        }
                         state.detail = !state.detail;
                         state.hud = true;
                     }
@@ -1098,6 +1131,26 @@ pub fn run(args: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reticule_finds_aimed_action_and_clears_in_flat_view() {
+        let events = crate::activity_data::demo_events();
+        let mut state = State {
+            zoom: 40.0,
+            pitch: -8.0,
+            ..State::default()
+        };
+        let data = slice(&events, &mut state);
+        state.focus = world(position(&data, 0));
+        render(&events, "fixture", &mut state, (120, 40), true);
+        assert!(
+            state.aimed.is_some(),
+            "aiming at a beacon must expose its summary"
+        );
+        state.flat = true;
+        render(&events, "fixture", &mut state, (120, 40), true);
+        assert_eq!(state.aimed, None);
+    }
+
     #[test]
     fn flight_clips_every_polygon_to_camera_and_screen_bounds() {
         let events = crate::activity_data::demo_events();

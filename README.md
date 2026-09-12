@@ -54,8 +54,10 @@ than the original view. It completes a circuit in roughly fifty-two seconds,
 with a changing altitude of 30–46 world units and a moderately downward forward-looking camera.
 Tall pastel gateways, information towers and varied glyph textures provide motion
 and depth cues. Record selection advances every four seconds across pages,
-agent districts and days. Nearby objects carry floating labels; the selected action has a descriptive black panel.
+agent districts and days. Nearby objects carry floating labels; a centre reticule describes the nearest action within its small aiming aperture on an opaque black panel. Empty sights say so; Enter opens the aimed action’s source.
 Telemetry uses the same textured pastel terrain, flight path and opaque readings panel.
+Both views compare front/back row buffers and publish changed rows in synchronized
+terminal updates, avoiding a full-screen erase between frames.
 Both views use 24-bit RGB shading with muted pastel terrain and vivid warm data highlights. Navigation
 keys pause the tour; Space resumes it. Select a record to inspect its project,
 session and source file. Lines describe

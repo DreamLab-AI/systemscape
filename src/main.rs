@@ -557,9 +557,12 @@ fn black_panel(width: usize, height: usize, lines: &[String]) -> String {
     if w < 6 || height < lines.len() + 5 {
         return String::new();
     }
-    let y = height - lines.len() - 2;
+    panel_at(3, height - lines.len() - 2, w, lines)
+}
+
+fn panel_at(x: usize, y: usize, w: usize, lines: &[String]) -> String {
     let mut out = format!(
-        "\x1b[{y};3H\x1b[48;2;0;0;0m\x1b[38;2;255;205;100m+{}+",
+        "\x1b[{y};{x}H\x1b[48;2;0;0;0m\x1b[38;2;255;205;100m+{}+",
         "-".repeat(w - 2)
     );
     for (i, line) in lines.iter().enumerate() {
@@ -569,18 +572,60 @@ fn black_panel(width: usize, height: usize, lines: &[String]) -> String {
             .take(w - 4)
             .collect();
         out.push_str(&format!(
-            "\x1b[{};3H| {}{} |",
+            "\x1b[{};{x}H| {}{} |",
             y + i + 1,
             text,
             " ".repeat(w - 4 - text.chars().count())
         ));
     }
     out.push_str(&format!(
-        "\x1b[{};3H+{}+\x1b[0m",
+        "\x1b[{};{x}H+{}+\x1b[0m",
         y + lines.len() + 1,
         "-".repeat(w - 2)
     ));
     out
+}
+
+/// Front/back row buffers avoid erasing the terminal between completed frames.
+#[derive(Default)]
+struct FrameBuffer {
+    front: Vec<String>,
+    dims: (usize, usize),
+}
+impl FrameBuffer {
+    fn present(&mut self, view: &View, overlay: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let rendered = format!("{view}");
+        let body = rendered
+            .split_once("\x1b[H\x1b[J")
+            .map_or(rendered.as_str(), |(_, body)| body);
+        let back: Vec<String> = body
+            .split("\r\n")
+            .take(view.height)
+            .map(str::to_owned)
+            .collect();
+        let resized = self.dims != (view.width, view.height);
+        let mut output = String::from("\x1b[?2026h");
+        if resized {
+            output.push_str("\x1b[2J");
+        }
+        for (y, row) in back.iter().enumerate() {
+            // Restore overlay regions before compositing this frame's panel.
+            let overlay_row =
+                y >= view.height.saturating_sub(9) || y.abs_diff(view.height / 2) <= 6;
+            if resized || overlay_row || self.front.get(y) != Some(row) {
+                output.push_str(&format!("\x1b[{};1H\x1b[0m{row}", y + 1));
+            }
+        }
+        output.push_str(overlay);
+        output.push_str("\x1b[0m\x1b[?2026l");
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(output.as_bytes())?;
+        stdout.flush()?;
+        self.front = back;
+        self.dims = (view.width, view.height);
+        Ok(())
+    }
 }
 
 fn main() {
@@ -648,6 +693,7 @@ fn main() {
     let mut theta: f64 = 0.0;
     let mut spin = true;
     let mut frame: u64 = 0;
+    let mut buffer = FrameBuffer::default();
     let slot_frames = (SLOT_SECS * f64::from(FPS)) as u64; // frames per history bar
 
     loop {
@@ -681,7 +727,6 @@ fn main() {
             dims = now_dims;
             view = make_view(dims);
             viewport.canvas_centre = view.center();
-            print!("\x1b[2J");
         }
 
         if frame > 0 && frame.is_multiple_of(u64::from(POLL_FRAMES)) {
@@ -721,10 +766,7 @@ fn main() {
             "CPU° · GPU° · DISK° · PWR · LOAD · MEM · IO · NET | height = normalised peak".into(),
             "2h history · 150s/bar · newest right · terrain decorative · Space pause/fly · arrows steer · q exit".into(),
         ]);
-        use std::io::Write;
-        let rendered = format!("\x1b[?2026h{view}{panel}\x1b[?2026l");
-        let _ = std::io::stdout().write_all(rendered.as_bytes());
-        let _ = std::io::stdout().flush();
+        let _ = buffer.present(&view, &panel);
         let _ = gameloop::sleep_fps(FPS, None);
     }
 }
