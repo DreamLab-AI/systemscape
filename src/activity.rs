@@ -130,16 +130,16 @@ fn tour_step(events: &[Event], state: &mut State, dt: f64) {
     }
     let data = slice(events, state);
     let depth = (data.lanes.len() as f64 * 1.5 + 2.0).max(5.5) * WORLD_SCALE;
-    let phase = state.tour_elapsed * 0.48;
-    let ahead = phase + 0.65;
+    let phase = state.tour_elapsed * 0.12;
+    let ahead = phase + 0.95;
     let eye = Vec3D::new(
         54.0 * phase.cos(),
         38.0 + 8.0 * (phase * 1.7).sin(),
         depth * 0.65 * phase.sin(),
     );
-    state.focus = Vec3D::new(48.0 * ahead.cos(), 1.0, depth * 0.55 * ahead.sin());
+    state.focus = Vec3D::new(48.0 * ahead.cos(), 9.5, depth * 0.55 * ahead.sin());
     state.camera_x = eye.x - state.focus.x;
-    state.pitch = eye.y - 28.0;
+    state.pitch = eye.y - state.focus.y - 28.0;
     state.zoom = eye.z - state.focus.z;
     state.yaw = 0.0;
 }
@@ -194,7 +194,7 @@ fn seconds(at: &str) -> f64 {
 
 /// Decorative terrain gives the time paths a shared spatial frame. Its relief
 /// is deterministic and does not pretend to encode throughput or task success.
-fn terrain(lanes: usize) -> Mesh3D {
+pub(crate) fn terrain(lanes: usize) -> Mesh3D {
     let mut mesh = Mesh3D::new(Vec::new(), Vec::new());
     let depth = (lanes as f64 * 1.5 + 2.0).max(5.5);
     let (nx, nz) = (80usize, 48usize);
@@ -223,25 +223,28 @@ fn terrain(lanes: usize) -> Mesh3D {
             } else {
                 ['░', ':', '+', '*', '=', '▒', ':', '+', '^', '▓', '*'][noise as usize]
             };
-            let colour = if coast {
-                Colour::rgb(38 + noise * 4, 110 + noise * 8, 210 + noise * 4)
+            let district = ((z / depth + 1.0) * 2.5) as usize;
+            let palettes = [
+                (8, 245, 225),
+                (185, 25, 255),
+                (18, 255, 92),
+                (255, 152, 12),
+                (35, 105, 255),
+                (255, 28, 145),
+            ];
+            let (r, g, b) = if coast {
+                (24, 155, 255)
             } else {
-                let district = ((z / depth + 1.0) * 2.5) as usize;
-                let palettes = [
-                    (35u8, 155u8, 180u8),
-                    (140, 60, 190),
-                    (30, 175, 85),
-                    (205, 115, 30),
-                    (40, 95, 200),
-                    (165, 50, 115),
-                ];
-                let (r, g, b) = palettes[district.min(5)];
-                Colour::rgb(
-                    r.saturating_add(noise * 4),
-                    g.saturating_add(noise * 5),
-                    b.saturating_add(noise * 4),
-                )
+                palettes[district.min(5)]
             };
+            // Wide luminance range supplies shaded valleys and emissive ridges,
+            // using full RGB rather than washing every glyph towards white.
+            let shade = 0.26 + 0.74 * (noise as f64 / 10.0).powf(0.7);
+            let colour = Colour::rgb(
+                (r as f64 * shade) as u8,
+                (g as f64 * shade) as u8,
+                (b as f64 * shade) as u8,
+            );
             let n = j * (nx + 1) + i;
             mesh.faces.push(crate::Face::new(
                 vec![n + 1, n + nx + 2, n + nx + 1, n],
@@ -252,7 +255,7 @@ fn terrain(lanes: usize) -> Mesh3D {
     mesh
 }
 
-fn texture(mesh: &mut Mesh3D, start: usize, glyph: char) {
+pub(crate) fn texture(mesh: &mut Mesh3D, start: usize, glyph: char) {
     for (index, face) in mesh.faces[start..].iter_mut().enumerate() {
         face.fill_char.text_char = if index % 5 == 4 { glyph } else { ':' };
     }
@@ -418,7 +421,7 @@ fn project(viewport: &Viewport, rotation: Transform3D, point: Vec3D) -> Vec2D {
 
 /// gemini-engine 1.2 does not clip polygons crossing the camera plane before
 /// rasterisation. Clip in camera space to bound raster work during close flight.
-fn clip_scene(mesh: Mesh3D, viewport: &Viewport, dims: (usize, usize)) -> Mesh3D {
+pub(crate) fn clip_scene(mesh: Mesh3D, viewport: &Viewport, dims: (usize, usize)) -> Mesh3D {
     let transform = viewport.camera_transform.mul_mat4(&mesh.transform);
     let inverse = transform.inverse();
     let scale = viewport.canvas_centre.x.max(viewport.canvas_centre.y) as f64;
@@ -974,7 +977,23 @@ pub fn run(args: &[String]) -> io::Result<()> {
             );
             // Build and publish a whole frame atomically to terminals supporting
             // synchronized updates (including tmux), avoiding half-painted terrain.
-            let frame = format!("\x1b[?2026h{view}\x1b[?2026l");
+            let data = slice(&events, &mut state);
+            let panel = data
+                .records
+                .get(state.selected)
+                .filter(|_| !state.hud && !state.flat && view.width >= 80 && view.height >= 25)
+                .map(|e| {
+                    crate::black_panel(
+                        view.width,
+                        view.height,
+                        &[
+                            format!("{} · {} · {}", e.agent, e.kind.to_uppercase(), e.at),
+                            e.text.clone(),
+                        ],
+                    )
+                })
+                .unwrap_or_default();
+            let frame = format!("\x1b[?2026h{view}{panel}\x1b[?2026l");
             io::stdout().write_all(frame.as_bytes())?;
             io::stdout().flush()?;
             dirty = false;

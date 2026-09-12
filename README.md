@@ -48,12 +48,14 @@ procedural island. Its glyph textures, coastline and relief provide a spatial
 frame; they do not encode work metrics. Prompt stems
 are taller than tool stems; height denotes record type, not cost or productivity.
 Green marks prompts, blue tools, rust errors and gold recorded commit receipts.
-The default tour flies rapidly through a landscape six times wider and deeper
-than the original view. It completes a circuit in roughly thirteen seconds,
-with a changing altitude of 30–46 world units and a forward-looking camera.
+The default tour flies smoothly through a landscape six times wider and deeper
+than the original view. It completes a circuit in roughly fifty-two seconds,
+with a changing altitude of 30–46 world units and a moderately downward forward-looking camera.
 Tall neon gateways, information towers and varied glyph textures provide motion
 and depth cues. Record selection advances every four seconds across pages,
-agent districts and days. Nearby objects carry floating labels. Navigation
+agent districts and days. Nearby objects carry floating labels; the selected action has a descriptive black panel.
+Telemetry uses the same textured neon terrain, flight path and opaque readings panel.
+Both views use 24-bit RGB shading with dark valleys and saturated highlights. Navigation
 keys pause the tour; Space resumes it. Select a record to inspect its project,
 session and source file. Lines describe
 temporal grouping within sessions, not proven causal dependencies or git ancestry.
@@ -138,7 +140,7 @@ Missing sources degrade gracefully — a wall simply doesn't appear.
   purple→pink, load/memory teal→white, throughput indigo→cyan→white,
   all as 24-bit ANSI colour.
 - **Live resize**: the canvas follows the terminal size every frame.
-- **Render rate**: telemetry runs at 10 FPS; CPU usage depends on pane size and sensor tools.
+- **Render rate**: telemetry targets 18 FPS; CPU usage depends on pane size and sensor tools.
 
 ## Build & run
 
@@ -157,7 +159,7 @@ bursts that drag CPU temperature and power with them, an independent
 mid-window GPU job that pulls disk temperature along, and a memory ramp —
 useful for checking the full visual without waiting two hours.
 
-Space pauses telemetry rotation, Left/Right adjusts its angle, and `q` quits.
+Space pauses telemetry flight, Left/Right adjusts its position, and `q` quits.
 
 ## tmux integration
 
@@ -180,8 +182,8 @@ exposes. Missing sources degrade gracefully. Disk and network rates derive
 from container-visible `/proc/diskstats` and `/proc/net/dev` counters.
 
 [DreamLab Agentbox](https://github.com/DreamLab-AI/agentbox) bakes SystemScape
-into its Nix-built runtime. The System pane keeps `btm` alongside for live
-attribution; the Activity window runs `systemscape --activity`.
+into its Nix-built runtime. The System pane starts zoomed to the landscape; tmux prefix then `z` reveals
+`btm` alongside for live attribution; the Activity window runs `systemscape --activity`.
 
 ## Tuning
 
@@ -191,11 +193,11 @@ Telemetry settings are constants at the top of `src/main.rs`:
 |----------|---------|---------|
 | `SLOT_SECS` | seconds per history bar (window = 48 × this) | 150 (2 h) |
 | `HISTORY` | bars per wall | 48 |
-| `SPIN` | rotation speed, rad/frame | 0.008 (~78 s/rev) |
-| `POLL_FRAMES` | frames between sensor polls | 20 (2 s) |
-| `FPS` | render rate | 10 |
+| `SPIN` | flight speed, rad/frame | 0.12 / 18 (~52 s/rev) |
+| `POLL_FRAMES` | frames between sensor polls | 36 (2 s) |
+| `FPS` | render rate | 18 |
 
-Camera angle lives in the `Viewport::new` call in `main()`.
+The flight path and look-ahead target live in the render loop in `main()`.
 
 ## License
 

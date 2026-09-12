@@ -30,17 +30,28 @@ def raster(raw, destination):
     image = Image.new('RGB', (200 * cell_w + 2 * margin, 65 * cell_h + 2 * margin), '#101722')
     draw = ImageDraw.Draw(image)
     colour = (204, 219, 235)
+    background = (16, 23, 34)
     for y, line in enumerate(raw.splitlines()[:65]):
         x = 0
         for chunk in re.split(r'(\x1b\[[0-9;]*m)', line):
             if chunk.startswith('\x1b['):
                 codes = [int(c) if c else 0 for c in chunk[2:-1].split(';')]
-                if len(codes) >= 5 and codes[:2] == [38, 2]:
-                    colour = tuple(codes[2:5])
-                elif 0 in codes or 39 in codes:
-                    colour = (204, 219, 235)
+                k = 0
+                while k < len(codes):
+                    code = codes[k]
+                    if code in (38, 48) and codes[k+1:k+2] == [2] and k+4 < len(codes):
+                        rgb = tuple(codes[k+2:k+5])
+                        if code == 38: colour = rgb
+                        else: background = rgb
+                        k += 5
+                        continue
+                    if code in (0, 39): colour = (204, 219, 235)
+                    if code in (0, 49): background = (16, 23, 34)
+                    if code == 40: background = (0, 0, 0)
+                    k += 1
                 continue
             for char in chunk:
+                draw.rectangle((margin+x*cell_w, margin+y*cell_h, margin+(x+1)*cell_w-1, margin+(y+1)*cell_h-1), fill=background)
                 if char == '█':
                     draw.rectangle((margin+x*cell_w, margin+y*cell_h, margin+(x+1)*cell_w-1, margin+(y+1)*cell_h-1), fill=colour)
                 elif char != ' ':

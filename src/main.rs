@@ -2,18 +2,17 @@
 //!
 //! Eight telemetry classes (thermals, power, load, memory, disk and network) are
 //! right-to-left scrolling histogram walls stacked into the depth axis, the
-//! whole scene rotating slowly through a full 360°. 48 bars × 150s = 2h
+//! camera flying slowly over a textured neon landscape. 48 bars × 150s = 2h
 //! window. Sensors are polled every ~2s and each bar keeps the PEAK seen in
 //! its 150s slot, so short spikes survive and can be correlated across
 //! classes. Rendered with gemini-engine (the renderer behind display3d).
 
 use gemini_engine::{
-    ascii::Text,
     core::{ColChar, Colour, Modifier, Vec2D},
     gameloop,
     mesh3d::{Face, Mesh3D, Transform3D, Vec3D},
     view::{View, WrappingMode},
-    view3d::{DisplayMode, Light, Viewport},
+    view3d::{DisplayMode, Viewport},
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -49,14 +48,14 @@ impl Drop for Terminal {
     }
 }
 
-const FPS: f32 = 10.0;
+const FPS: f32 = 18.0;
 const FOV: f64 = 60.0;
-const POLL_FRAMES: u32 = 20; // sensor poll every 2s
+const POLL_FRAMES: u32 = 36; // sensor poll every 2s
 const SLOT_SECS: f64 = 150.0; // one history bar per 150s
 const HISTORY: usize = 48; // 48 × 150s = 2h end to end
 const DX: f64 = 0.42; // time-axis spacing
 const ROW_GAP: f64 = 1.3; // depth spacing between class walls
-const SPIN: f64 = 0.008; // rad/frame — full turn ≈ 78s
+const SPIN: f64 = 0.12 / 18.0; // same ~52s circuit as activity
 
 fn read_f64(path: &str) -> Option<f64> {
     fs::read_to_string(path).ok()?.trim().parse::<f64>().ok()
@@ -95,19 +94,19 @@ impl Scale {
         match self {
             Self::Thermal => gradient(
                 &[
-                    (0.00, (59, 130, 246)),
-                    (0.30, (34, 197, 94)),
-                    (0.55, (234, 179, 8)),
-                    (0.78, (249, 115, 22)),
-                    (1.00, (239, 68, 68)),
+                    (0.00, (30, 90, 255)),
+                    (0.30, (10, 255, 100)),
+                    (0.55, (255, 210, 5)),
+                    (0.78, (255, 90, 5)),
+                    (1.00, (255, 25, 70)),
                 ],
                 n,
             ),
-            Self::Power => gradient(&[(0.0, (91, 33, 182)), (1.0, (236, 72, 153))], n),
+            Self::Power => gradient(&[(0.0, (100, 15, 220)), (1.0, (255, 35, 180))], n),
             Self::Load => gradient(
                 &[
-                    (0.0, (15, 118, 110)),
-                    (0.6, (34, 211, 238)),
+                    (0.0, (5, 155, 105)),
+                    (0.6, (10, 255, 245)),
                     (1.0, (240, 253, 250)),
                 ],
                 n,
@@ -409,7 +408,8 @@ fn push_bar(
 /// The drawn bars are re-centred on the rotation axis so a partially-filled
 /// history doesn't orbit off screen.
 fn build_scene(channels: &[Channel], scroll: f64) -> Mesh3D {
-    let mut mesh = Mesh3D::new(Vec::new(), Vec::new());
+    let mut mesh = activity::terrain(channels.len());
+    let terrain_faces = mesh.faces.len();
     let right = HISTORY as f64 * DX / 2.0;
     let n_ch = channels.len() as f64;
     let max_len = channels.iter().map(|c| c.history.len()).max().unwrap_or(0);
@@ -446,6 +446,12 @@ fn build_scene(channels: &[Channel], scroll: f64) -> Mesh3D {
                 ch.scale.colour(n),
             );
         }
+    }
+    activity::texture(&mut mesh, terrain_faces, '▓');
+    for v in &mut mesh.vertices {
+        v.x *= 6.0;
+        v.z *= 6.0;
+        v.y *= 2.0;
     }
     mesh
 }
@@ -539,17 +545,49 @@ fn term_dims() -> (usize, usize) {
     let (w, h) = terminal_size::terminal_size()
         .map(|(tw, th)| (i64::from(tw.0), i64::from(th.0)))
         .unwrap_or((110, 32));
-    (w.clamp(40, 300) as usize, (h - 1).clamp(16, 100) as usize)
+    (w.clamp(1, 512) as usize, (h - 1).clamp(1, 180) as usize)
 }
 
 fn make_view(dims: (usize, usize)) -> View {
     View::new(dims.0, dims.1, ColChar::EMPTY).with_wrapping_mode(WrappingMode::Ignore)
 }
 
+/// Opaque terminal overlay: every cell, including padding, gets a true black background.
+fn black_panel(width: usize, height: usize, lines: &[String]) -> String {
+    let w = width.saturating_sub(4).min(116);
+    if w < 6 || height < lines.len() + 5 {
+        return String::new();
+    }
+    let y = height - lines.len() - 2;
+    let mut out = format!(
+        "\x1b[{y};3H\x1b[48;2;0;0;0m\x1b[38;2;90;230;255m+{}+",
+        "-".repeat(w - 2)
+    );
+    for (i, line) in lines.iter().enumerate() {
+        let text: String = line
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(w - 4)
+            .collect();
+        out.push_str(&format!(
+            "\x1b[{};3H| {}{} |",
+            y + i + 1,
+            text,
+            " ".repeat(w - 4 - text.chars().count())
+        ));
+    }
+    out.push_str(&format!(
+        "\x1b[{};3H+{}+\x1b[0m",
+        y + lines.len() + 1,
+        "-".repeat(w - 2)
+    ));
+    out
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("systemscape {}\n\nUsage: systemscape [--demo]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: eight 3D history walls. Space pauses spin; arrows rotate; q quits.\nActivity: full-screen fast flight through local work, targeting 18 FPS. Navigation pauses it.\n          Arrows rotate/tilt, +/- zoom, j/k select, [/] day, Tab agent lanes,\n          PgUp/PgDn records, Enter source, f flat view, ? details, h districts, Space resumes tour, q quits.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
+        println!("systemscape {}\n\nUsage: systemscape [--demo]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: neon 3D history landscape. Space pauses flight; arrows steer; q quits.\nActivity: full-screen scenic flight through local work, targeting 18 FPS. Navigation pauses it.\n          Arrows rotate/tilt, +/- zoom, j/k select, [/] day, Tab agent lanes,\n          PgUp/PgDn records, Enter source, f flat view, ? details, h districts, Space resumes tour, q quits.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -586,12 +624,7 @@ fn main() {
         FOV,
         view.center(),
     );
-    viewport.display_mode = DisplayMode::Illuminated {
-        lights: vec![
-            Light::new_ambient(0.55),
-            Light::new_directional(0.45, Vec3D::new(2.0, 1.0, 3.0)),
-        ],
-    };
+    viewport.display_mode = DisplayMode::Solid;
 
     let mut channels = vec![
         Channel::new("CPU°", 25.0, 95.0, Scale::Thermal),
@@ -629,8 +662,14 @@ fn main() {
                             return
                         }
                         KeyCode::Char(' ') => spin = !spin,
-                        KeyCode::Left => theta -= 0.12,
-                        KeyCode::Right => theta += 0.12,
+                        KeyCode::Left => {
+                            theta -= 0.12;
+                            spin = false;
+                        }
+                        KeyCode::Right => {
+                            theta += 0.12;
+                            spin = false;
+                        }
                         _ => (),
                     }
                 }
@@ -662,31 +701,31 @@ fn main() {
             theta = (theta + SPIN) % std::f64::consts::TAU;
         }
 
-        let scene = build_scene(&channels, scroll);
-        viewport.objects = vec![scene.with_transform(Transform3D::from_rotation_y(theta))];
-
+        let eye = Vec3D::new(
+            54.0 * theta.cos(),
+            38.0 + 8.0 * (theta * 1.7).sin(),
+            54.0 * theta.sin(),
+        );
+        let ahead = theta + 0.95;
+        viewport.camera_transform = Transform3D::look_at_lh(
+            eye,
+            Vec3D::new(48.0 * ahead.cos(), 9.5, 46.0 * ahead.sin()),
+            Vec3D::NEG_Y,
+        );
+        viewport.fov = dims.0 as f64 * 0.65;
+        let scene = activity::clip_scene(build_scene(&channels, scroll), &viewport, dims);
+        viewport.objects = vec![scene.with_transform(Transform3D::IDENTITY)];
         view.clear();
         view.draw(&viewport);
-        view.draw(&Text::new(
-            Vec2D::new(1, 0),
-            &now_bar(&snap),
-            Modifier::Colour(Colour::rgb(169, 177, 214)),
-        ));
-        let legend_y = view.center().y * 2 - 1;
-        let legend = format!(
-            "front→back: {} · 2h window · 150s/bar (peak-hold) · newest→right",
-            channels
-                .iter()
-                .map(|c| c.tag)
-                .collect::<Vec<_>>()
-                .join(" · ")
-        );
-        view.draw(&Text::new(
-            Vec2D::new(1, legend_y),
-            &legend,
-            Modifier::Colour(Colour::rgb(86, 95, 137)),
-        ));
-        let _ = view.display_render();
+        let panel = black_panel(dims.0, dims.1, &[
+            now_bar(&snap),
+            "CPU° · GPU° · DISK° · PWR · LOAD · MEM · IO · NET | height = normalised peak".into(),
+            "2h history · 150s/bar · newest right · terrain decorative · Space pause/fly · arrows steer · q exit".into(),
+        ]);
+        use std::io::Write;
+        let rendered = format!("\x1b[?2026h{view}{panel}\x1b[?2026l");
+        let _ = std::io::stdout().write_all(rendered.as_bytes());
+        let _ = std::io::stdout().flush();
         let _ = gameloop::sleep_fps(FPS, None);
     }
 }

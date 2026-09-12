@@ -47,6 +47,20 @@ try:
     time.sleep(0.3)
     result = subprocess.run(['tmux', '-L', socket, 'has-session', '-t', 'test'], capture_output=True)
     assert result.returncode != 0, 'quit left the renderer running'
-    print('PASS: continuous tour, manual pause, resume, source, flat view, tiny resize, quit')
+    tmux('new-session', '-d', '-s', 'test', '-x', '120', '-y', '40', f'{binary} --demo')
+    time.sleep(0.6)
+    first = capture()
+    assert '2h history' in first and 'NOW' in first
+    time.sleep(0.6)
+    assert capture() != first, 'telemetry flight did not move'
+    ansi = tmux('capture-pane', '-e', '-p', '-t', 'test:0')
+    assert '48;2;0;0;0' in ansi or '[40m' in ansi, 'black panel missing'
+    tmux('resize-window', '-t', 'test:0', '-x', '20', '-y', '8')
+    time.sleep(0.3)
+    assert tmux('list-panes', '-t', 'test:0', '-F', '#{pane_dead}').strip() == '0'
+    tmux('send-keys', '-t', 'test:0', 'q')
+    time.sleep(0.3)
+    assert subprocess.run(['tmux', '-L', socket, 'has-session', '-t', 'test'], capture_output=True).returncode != 0
+    print('PASS: activity tour, manual pause, resume, source, flat; telemetry flight and black panel; tiny resize and quit in both modes')
 finally:
     tmux('kill-server', check=False)
