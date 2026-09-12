@@ -9,7 +9,7 @@ The repository was previously named `thermal3d`; the binary remains `systemscape
 
 ## Screenshots
 
-These are captures of the running application in 120×40 tmux panes. Activity
+These are captures of the running application in 200×65 tmux panes. Activity
 uses synthetic records; telemetry uses a synthetic history with live NOW readings.
 
 **Agent work in 3D** — a textured ASCII island holds time paths and agent
@@ -48,9 +48,12 @@ procedural island. Its glyph textures, coastline and relief provide a spatial
 frame; they do not encode work metrics. Prompt stems
 are taller than tool stems; height denotes record type, not cost or productivity.
 Green marks prompts, blue tools, rust errors and gold recorded commit receipts.
-The default flying tour sweeps the camera through the landscape and selects a
-record every four seconds, continuing through record pages, agent lanes and days.
-It eases towards the selected action while changing angle and distance. Navigation
+The default tour flies rapidly through a landscape six times wider and deeper
+than the original view. It completes a circuit in roughly thirteen seconds,
+with a changing altitude of 30–46 world units and a forward-looking camera.
+Tall neon gateways, information towers and varied glyph textures provide motion
+and depth cues. Record selection advances every four seconds across pages,
+agent districts and days. Nearby objects carry floating labels. Navigation
 keys pause the tour; Space resumes it. Select a record to inspect its project,
 session and source file. Lines describe
 temporal grouping within sessions, not proven causal dependencies or git ancestry.
@@ -67,14 +70,19 @@ temporal grouping within sessions, not proven causal dependencies or git ancestr
 | Enter | Toggle source path / project and session |
 | `f` | Switch between flat and 3D views |
 | Space | Pause / resume the continuous flying tour |
-| `0` | Reset camera |
+| `0` | Pull back to an overview |
+| `?` | Toggle detailed information and coverage |
+| `h` | Toggle the agent district sidebar |
 | `q`, Escape, Ctrl-C | Quit and restore the terminal |
 
 No model calls, network requests, database or writes to source histories are
 needed. The collector polls every two seconds and discovers files every 30 seconds.
 It reads at most 1 MiB per file and 8 MiB per poll, tracks at most 256 files and
 retains 5,000 records. The scene shows eight lanes and 128 records per page.
-The tour runs at four frames per second. Once paused, the view redraws only when
+The full-screen tour targets 18 frames per second and supports panes up to
+512 columns × 180 rows. This deliberately spends more CPU on smooth motion and
+rich terrain. Large panels are hidden by default; `?` restores details and
+coverage, and `h` restores the district sidebar. Once paused, the view redraws only when
 data, controls or pane size change. The application keeps reading new work while
 you explore manually.
 

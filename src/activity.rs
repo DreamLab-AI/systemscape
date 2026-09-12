@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const MAX_NODES: usize = 128;
+const WORLD_SCALE: f64 = 6.0;
+const FRAME_MS: u64 = 55; // ~18 FPS; operator prefers motion richness over minimum CPU
 const MAX_LANES: usize = 8;
 const POLL: Duration = Duration::from_secs(2);
 
@@ -31,6 +33,8 @@ struct State {
     camera_x: f64,
     flat: bool,
     detail: bool,
+    districts: bool,
+    hud: bool,
 }
 
 struct Slice<'a> {
@@ -111,7 +115,8 @@ fn advance_selection(events: &[Event], state: &mut State) {
     }
 }
 
-/// Slow dolly + sweep, easing towards the selected action instead of snapping.
+/// Elevated forward flight through a 144-unit landscape. The camera and
+/// look-ahead point travel independently, exposing near/far motion parallax.
 fn tour_step(events: &[Event], state: &mut State, dt: f64) {
     if !state.tour || events.is_empty() {
         return;
@@ -124,38 +129,52 @@ fn tour_step(events: &[Event], state: &mut State, dt: f64) {
         advance_selection(events, state);
     }
     let data = slice(events, state);
-    let mut target = Vec3D::new(0.0, 0.5, 0.0);
-    if let Some(record) = data.records.get(state.selected) {
-        let first = data.records.first().map_or(0.0, |e| seconds(&e.at));
-        let last = data.records.last().map_or(first, |e| seconds(&e.at));
-        let x = if last > first {
-            8.5 - 17.0 * (seconds(&record.at) - first) / (last - first)
-        } else {
-            0.0
-        };
-        let lane = data
-            .lanes
-            .iter()
-            .position(|a| a == &record.agent)
-            .unwrap_or(0);
-        target = Vec3D::new(x * 0.3, 0.5, lane_z(lane, data.lanes.len()) * 0.3);
-    }
-    let ease = 1.0 - (-dt * 1.2).exp();
-    state.focus = state.focus.lerp(target, ease);
-    let phase = state.tour_elapsed / 18.0;
-    state.yaw += ((-0.2 + phase.sin() * 0.42) - state.yaw) * ease;
-    state.pitch += ((phase.mul_add(0.7, 0.0).sin() * 6.0) - state.pitch) * ease;
-    state.zoom += ((46.0 + (phase * 0.6).sin() * 5.0) - state.zoom) * ease;
-    state.camera_x += ((phase.cos() * 3.0) - state.camera_x) * ease;
+    let depth = (data.lanes.len() as f64 * 1.5 + 2.0).max(5.5) * WORLD_SCALE;
+    let phase = state.tour_elapsed * 0.48;
+    let ahead = phase + 0.65;
+    let eye = Vec3D::new(
+        54.0 * phase.cos(),
+        38.0 + 8.0 * (phase * 1.7).sin(),
+        depth * 0.65 * phase.sin(),
+    );
+    state.focus = Vec3D::new(48.0 * ahead.cos(), 1.0, depth * 0.55 * ahead.sin());
+    state.camera_x = eye.x - state.focus.x;
+    state.pitch = eye.y - 28.0;
+    state.zoom = eye.z - state.focus.z;
+    state.yaw = 0.0;
+}
+
+fn world(point: Vec3D) -> Vec3D {
+    Vec3D::new(point.x * WORLD_SCALE, point.y * 2.0, point.z * WORLD_SCALE)
+}
+
+fn steer(state: &mut State, yaw: f64, rise: f64) {
+    let offset = Vec3D::new(state.camera_x, 28.0 + state.pitch, state.zoom);
+    let eye = state.focus + offset;
+    let mut direction = Transform3D::from_rotation_y(yaw).transform_vector3(-offset);
+    direction.y += rise * direction.length();
+    state.focus = eye + direction;
+    state.camera_x = -direction.x;
+    state.pitch = -direction.y - 28.0;
+    state.zoom = -direction.z;
+}
+
+fn dolly(state: &mut State, factor: f64) {
+    let offset = Vec3D::new(state.camera_x, 28.0 + state.pitch, state.zoom);
+    let distance = offset.length();
+    let scaled = offset * ((distance * factor).clamp(8.0, 250.0) / distance.max(0.01));
+    state.camera_x = scaled.x;
+    state.pitch = scaled.y - 28.0;
+    state.zoom = scaled.z;
 }
 
 fn colour(kind: &str) -> Colour {
     match kind {
-        "prompt" => Colour::rgb(91, 205, 176),
-        "failure" => Colour::rgb(238, 112, 78),
-        "receipt" => Colour::rgb(233, 193, 101),
-        "tool" => Colour::rgb(99, 147, 195),
-        _ => Colour::rgb(157, 135, 198),
+        "prompt" => Colour::rgb(20, 255, 190),
+        "failure" => Colour::rgb(255, 65, 150),
+        "receipt" => Colour::rgb(255, 225, 40),
+        "tool" => Colour::rgb(45, 185, 255),
+        _ => Colour::rgb(195, 80, 255),
     }
 }
 
@@ -178,12 +197,12 @@ fn seconds(at: &str) -> f64 {
 fn terrain(lanes: usize) -> Mesh3D {
     let mut mesh = Mesh3D::new(Vec::new(), Vec::new());
     let depth = (lanes as f64 * 1.5 + 2.0).max(5.5);
-    let (nx, nz) = (36usize, 24usize);
+    let (nx, nz) = (80usize, 48usize);
     for j in 0..=nz {
         for i in 0..=nx {
             let x = -12.0 + 24.0 * i as f64 / nx as f64;
             let z = -depth + 2.0 * depth * j as f64 / nz as f64;
-            let relief = (x * 0.52).sin() * (z * 0.73).cos() * 0.30;
+            let relief = (x * 0.52).sin() * (z * 0.73).cos() * 1.35;
             let coast = (x / 12.0).powi(4) + (z / depth).powi(4);
             let y = -0.85 + relief - coast * 0.55;
             mesh.vertices.push(Vec3D::new(x, y, z));
@@ -202,12 +221,26 @@ fn terrain(lanes: usize) -> Mesh3D {
             let glyph = if coast {
                 ['~', ':', '.'][noise as usize % 3]
             } else {
-                ['.', ':', '+', '*', '=', '.', ':', '+', '^', '.', '*'][noise as usize]
+                ['░', ':', '+', '*', '=', '▒', ':', '+', '^', '▓', '*'][noise as usize]
             };
             let colour = if coast {
-                Colour::rgb(31 + noise * 2, 69 + noise * 3, 128 + noise * 5)
+                Colour::rgb(38 + noise * 4, 110 + noise * 8, 210 + noise * 4)
             } else {
-                Colour::rgb(22 + noise * 2, 72 + noise * 5, 135 + noise * 7)
+                let district = ((z / depth + 1.0) * 2.5) as usize;
+                let palettes = [
+                    (35u8, 155u8, 180u8),
+                    (140, 60, 190),
+                    (30, 175, 85),
+                    (205, 115, 30),
+                    (40, 95, 200),
+                    (165, 50, 115),
+                ];
+                let (r, g, b) = palettes[district.min(5)];
+                Colour::rgb(
+                    r.saturating_add(noise * 4),
+                    g.saturating_add(noise * 5),
+                    b.saturating_add(noise * 4),
+                )
             };
             let n = j * (nx + 1) + i;
             mesh.faces.push(crate::Face::new(
@@ -241,7 +274,7 @@ fn position(data: &Slice<'_>, index: usize) -> Vec3D {
         .unwrap_or(0);
     Vec3D::new(
         x,
-        if record.kind == "prompt" { 2.2 } else { 1.3 },
+        if record.kind == "prompt" { 5.5 } else { 2.8 },
         lane_z(lane, data.lanes.len()),
     )
 }
@@ -254,7 +287,21 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
         let f = mesh.faces.len();
         push_bar(&mut mesh, 0.0, z, 9.0, 0.045, 0.06, rail);
         texture(&mut mesh, f, '=');
-        node(&mut mesh, Vec3D::new(-9.0, 0.0, z), 0.17, rail);
+        // Each agent district has a luminous gateway: stable large landmarks
+        // make camera motion legible even where recorded actions are sparse.
+        for x in [-9.5, 9.5] {
+            let f = mesh.faces.len();
+            push_bar(&mut mesh, x, z - 0.8, 0.10, 0.10, 6.0, colour("tool"));
+            push_bar(&mut mesh, x, z + 0.8, 0.10, 0.10, 6.0, colour("event"));
+            texture(&mut mesh, f, '#');
+            let v = mesh.vertices.len();
+            let f = mesh.faces.len();
+            push_bar(&mut mesh, x, z, 0.10, 0.9, 0.22, colour("prompt"));
+            for vertex in &mut mesh.vertices[v..] {
+                vertex.y += 6.0;
+            }
+            texture(&mut mesh, f, '=');
+        }
     }
     let first = data.records.first().map_or(0.0, |e| seconds(&e.at));
     let last = data.records.last().map_or(first, |e| seconds(&e.at));
@@ -277,7 +324,7 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
         } else {
             branch.1 += 1;
         }
-        let y = if e.kind == "prompt" { 2.2 } else { 1.3 };
+        let y = if e.kind == "prompt" { 5.5 } else { 2.8 };
         let col = if i == selected {
             Colour::rgb(255, 255, 255)
         } else {
@@ -324,6 +371,9 @@ fn scene(data: &Slice<'_>, selected: usize) -> Mesh3D {
             texture(&mut mesh, f, '-');
         }
     }
+    for vertex in &mut mesh.vertices {
+        *vertex = world(*vertex);
+    }
     mesh
 }
 
@@ -366,6 +416,69 @@ fn project(viewport: &Viewport, rotation: Transform3D, point: Vec3D) -> Vec2D {
     )
 }
 
+/// gemini-engine 1.2 does not clip polygons crossing the camera plane before
+/// rasterisation. Clip in camera space to bound raster work during close flight.
+fn clip_scene(mesh: Mesh3D, viewport: &Viewport, dims: (usize, usize)) -> Mesh3D {
+    let transform = viewport.camera_transform.mul_mat4(&mesh.transform);
+    let inverse = transform.inverse();
+    let scale = viewport.canvas_centre.x.max(viewport.canvas_centre.y) as f64;
+    let focal = 1.0 / (viewport.fov.to_radians() * 0.5).tan();
+    let cx = viewport.canvas_centre.x as f64;
+    let cy = viewport.canvas_centre.y as f64;
+    let planes = [
+        (Vec3D::Z, -2.0),
+        (-Vec3D::Z, 600.0),
+        (Vec3D::new(-1.0, 0.0, cx / (2.0 * focal * scale)), 0.0),
+        (
+            Vec3D::new(1.0, 0.0, (dims.0 as f64 - cx) / (2.0 * focal * scale)),
+            0.0,
+        ),
+        (Vec3D::new(0.0, 1.0, cy / (focal * scale)), 0.0),
+        (
+            Vec3D::new(0.0, -1.0, (dims.1 as f64 - cy) / (focal * scale)),
+            0.0,
+        ),
+    ];
+    let mut output = Mesh3D::new(Vec::new(), Vec::new()).with_transform(mesh.transform);
+    for face in &mesh.faces {
+        let mut polygon: Vec<_> = face
+            .v_indices
+            .iter()
+            .map(|&i| transform.transform_point3(mesh.vertices[i]))
+            .collect();
+        for (normal, offset) in planes {
+            if polygon.is_empty() {
+                break;
+            }
+            let mut clipped = Vec::new();
+            for i in 0..polygon.len() {
+                let a = polygon[i];
+                let b = polygon[(i + 1) % polygon.len()];
+                let da = normal.dot(a) + offset;
+                let db = normal.dot(b) + offset;
+                if da >= 0.0 {
+                    clipped.push(a);
+                }
+                if (da >= 0.0) != (db >= 0.0) {
+                    clipped.push(a.lerp(b, da / (da - db)));
+                }
+            }
+            polygon = clipped;
+        }
+        if polygon.len() >= 3 {
+            let first = output.vertices.len();
+            output
+                .vertices
+                .extend(polygon.iter().map(|p| inverse.transform_point3(*p)));
+            output.faces.push(crate::Face::new(
+                (first..output.vertices.len()).collect(),
+                face.fill_char,
+            ));
+        }
+    }
+    output
+}
+
 fn render(
     events: &[Event],
     coverage: &str,
@@ -377,8 +490,9 @@ fn render(
     let mut view = make_view(dims);
     let muted = Colour::rgb(126, 144, 164);
     let bright = Colour::rgb(204, 219, 235);
-    let footer = dims.1.saturating_sub(7) as i64;
-    let sidebar = if dims.0 >= 110 && !state.flat && dims.1 >= 25 {
+    let full_hud = state.hud || state.flat || dims.0 < 80 || dims.1 < 25;
+    let footer = dims.1.saturating_sub(if full_hud { 7 } else { 1 }) as i64;
+    let sidebar = if state.districts && dims.0 >= 110 && !state.flat && dims.1 >= 25 {
         25i64
     } else {
         0
@@ -386,7 +500,7 @@ fn render(
     // A quiet glyph field supplies depth outside the island without resembling
     // additional events. World terrain and event geometry are projected over it.
     if !state.flat && dims.0 >= 80 && dims.1 >= 25 {
-        for y in 4..footer {
+        for y in 1..footer {
             for x in 1..dims.0 as i64 - 1 {
                 let noise = (x * 73 + y * 151 + x * y * 7) % 97;
                 if noise < 8 {
@@ -439,18 +553,65 @@ fn render(
                 state.focus + Vec3D::new(0.0, 0.5, 0.0),
                 Vec3D::NEG_Y,
             ),
-            60.0,
+            82.0,
             Vec2D::new((dims.0 as i64 + sidebar) / 2, (footer + 4) / 2),
         );
         viewport.display_mode = DisplayMode::Solid;
         let rotation = Transform3D::from_rotation_y(state.yaw);
-        viewport.objects = vec![scene(&data, state.selected).with_transform(rotation)];
+        viewport.objects = vec![clip_scene(
+            scene(&data, state.selected).with_transform(rotation),
+            &viewport,
+            dims,
+        )];
         view.draw(&viewport);
+        let mut labelled: Vec<Vec2D> = Vec::new();
+        let mut candidates: Vec<_> = data
+            .records
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let pos = world(position(&data, i));
+                let camera = viewport.camera_transform.transform_point3(pos);
+                (i, e, pos, camera.z)
+            })
+            .filter(|(_, _, _, z)| *z > 2.0)
+            .collect();
+        candidates.sort_by(|a, b| a.3.total_cmp(&b.3));
+        for (i, record, pos, _) in candidates.into_iter().take(24) {
+            if i == state.selected {
+                continue;
+            }
+            let p = project(&viewport, rotation, pos + Vec3D::new(0.0, 0.8, 0.0));
+            if p.x <= sidebar || p.x >= dims.0 as i64 - 12 || p.y < 2 || p.y >= footer - 1 {
+                continue;
+            }
+            if labelled
+                .iter()
+                .any(|q| (q.y - p.y).abs() < 2 && (q.x - p.x).abs() < 32)
+            {
+                continue;
+            }
+            label(
+                &mut view,
+                p.x,
+                p.y,
+                &format!(
+                    "{} {}",
+                    record.kind.to_uppercase(),
+                    record.text.chars().take(22).collect::<String>()
+                ),
+                colour(&record.kind),
+            );
+            labelled.push(p);
+            if labelled.len() >= 12 {
+                break;
+            }
+        }
         if let Some(record) = data.records.get(state.selected) {
             let p = project(
                 &viewport,
                 rotation,
-                position(&data, state.selected) + Vec3D::new(0.0, 0.7, 0.0),
+                world(position(&data, state.selected) + Vec3D::new(0.0, 0.7, 0.0)),
             );
             if p.x > sidebar && p.y > 5 && p.y < footer - 1 {
                 label(
@@ -478,7 +639,7 @@ fn render(
             let p = project(
                 &viewport,
                 rotation,
-                Vec3D::new(9.0, 0.2, lane_z(i, data.lanes.len())),
+                world(Vec3D::new(9.0, 0.2, lane_z(i, data.lanes.len()))),
             );
             if p.x >= 0 && p.y > 3 && p.y < footer {
                 let name = if sidebar > 0 {
@@ -552,6 +713,25 @@ fn render(
             Colour::rgb(233, 173, 100),
         );
     }
+    if !full_hud {
+        label(&mut view, 0, 0, &" ".repeat(dims.0), bright);
+        label(
+            &mut view,
+            1,
+            0,
+            &format!(
+                "SYSTEMSCAPE  //  {}  //  {}{}  //  {} recorded objects",
+                data.day,
+                if state.tour { "FLYING TOUR" } else { "MANUAL" },
+                if demo { " · DEMO" } else { "" },
+                data.records.len()
+            ),
+            Colour::rgb(63, 235, 255),
+        );
+        label(&mut view, 0, footer, &" ".repeat(dims.0), bright);
+        label(&mut view, 1, footer, "Space pause/fly · arrows steer · +/- zoom · ? details/coverage · h districts · Enter source · 0 overview · q exit", muted);
+        return view;
+    }
     label(
         &mut view,
         1,
@@ -565,7 +745,7 @@ fn render(
                 "local history"
             },
             if state.tour {
-                "FLYING TOUR"
+                "FLYING TOUR · FAST / HIGH ALTITUDE"
             } else {
                 "MANUAL · Space resumes tour"
             }
@@ -649,7 +829,7 @@ fn render(
         &mut view,
         1,
         footer + 5,
-        "PgUp/PgDn records  Enter source  f flat/3D  0 reset camera  q quit",
+        "PgUp/PgDn records  Enter source  f flat/3D  h districts  0 overview  q quit",
         bright,
     );
     view
@@ -750,6 +930,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         tour: true,
         ..State::default()
     };
+    tour_step(&events, &mut state, 0.0);
     if snapshot {
         if !io::stdout().is_terminal() {
             return Err(io::Error::new(
@@ -774,7 +955,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             coverage = new_coverage;
             next_poll = Instant::now() + POLL;
         }
-        if last_frame.elapsed() >= Duration::from_millis(250) {
+        if last_frame.elapsed() >= Duration::from_millis(FRAME_MS) {
             tour_step(&events, &mut state, last_frame.elapsed().as_secs_f64());
             last_frame = Instant::now();
             dirty |= state.tour && !events.is_empty();
@@ -786,8 +967,8 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 &coverage,
                 &mut state,
                 (
-                    usize::from(dims.0).clamp(1, 300),
-                    usize::from(dims.1).saturating_sub(1).clamp(1, 100),
+                    usize::from(dims.0).clamp(1, 512),
+                    usize::from(dims.1).saturating_sub(1).clamp(1, 180),
                 ),
                 demo,
             );
@@ -795,7 +976,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             io::stdout().flush()?;
             dirty = false;
         }
-        if !event::poll(Duration::from_millis(250))? {
+        if !event::poll(Duration::from_millis(FRAME_MS))? {
             continue;
         }
         match event::read()? {
@@ -821,14 +1002,12 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Left => state.yaw -= 0.12,
-                    KeyCode::Right => state.yaw += 0.12,
-                    KeyCode::Up => state.pitch = (state.pitch + 1.0).min(15.0),
-                    KeyCode::Down => state.pitch = (state.pitch - 1.0).max(-8.0),
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        state.zoom = (state.zoom - 2.0).max(16.0)
-                    }
-                    KeyCode::Char('-') => state.zoom = (state.zoom + 2.0).min(60.0),
+                    KeyCode::Left => steer(&mut state, -0.12, 0.0),
+                    KeyCode::Right => steer(&mut state, 0.12, 0.0),
+                    KeyCode::Up => steer(&mut state, 0.0, 0.12),
+                    KeyCode::Down => steer(&mut state, 0.0, -0.12),
+                    KeyCode::Char('+') | KeyCode::Char('=') => dolly(&mut state, 0.88),
+                    KeyCode::Char('-') => dolly(&mut state, 1.12),
                     KeyCode::Char(' ') => {
                         state.tour = !state.tour;
                         state.dwell = 0.0;
@@ -857,11 +1036,17 @@ pub fn run(args: &[String]) -> io::Result<()> {
                         state.selected = 0;
                     }
                     KeyCode::Char('f') => state.flat = !state.flat,
-                    KeyCode::Enter => state.detail = !state.detail,
+                    KeyCode::Char('h') => state.districts = !state.districts,
+                    KeyCode::Enter => {
+                        state.detail = !state.detail;
+                        state.hud = true;
+                    }
+                    KeyCode::Char('?') => state.hud = !state.hud,
                     KeyCode::Char('0') => {
                         state.yaw = -0.3;
                         state.pitch = 0.0;
-                        state.zoom = 40.0;
+                        state.zoom = 180.0;
+                        state.pitch = 65.0;
                         state.focus = Vec3D::ZERO;
                         state.camera_x = 0.0;
                     }
@@ -877,6 +1062,35 @@ pub fn run(args: &[String]) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn flight_clips_every_polygon_to_camera_and_screen_bounds() {
+        let events = crate::activity_data::demo_events();
+        let mut state = State {
+            tour: true,
+            ..State::default()
+        };
+        for _ in 0..30 {
+            tour_step(&events, &mut state, 0.5);
+            let data = slice(&events, &mut state);
+            let viewport = Viewport::new(
+                Transform3D::look_at_lh(
+                    state.focus + Vec3D::new(state.camera_x, 28.0 + state.pitch, state.zoom),
+                    state.focus,
+                    Vec3D::NEG_Y,
+                ),
+                82.0,
+                Vec2D::new(100, 32),
+            );
+            let clipped = clip_scene(scene(&data, state.selected), &viewport, (200, 65));
+            assert!(!clipped.faces.is_empty());
+            for point in clipped.vertices {
+                let camera = viewport.camera_transform.transform_point3(point);
+                assert!(camera.z >= 2.0 - 1e-8);
+                let p = project(&viewport, Transform3D::IDENTITY, point);
+                assert!((-1..=201).contains(&p.x) && (-1..=66).contains(&p.y));
+            }
+        }
+    }
+    #[test]
     fn tour_moves_camera_advances_records_and_pauses() {
         let events = crate::activity_data::demo_events();
         let mut state = State {
@@ -889,7 +1103,7 @@ mod tests {
         }
         assert_eq!(state.selected, 1);
         assert!(state.focus.is_finite());
-        assert!(state.yaw != 0.0 && state.zoom != 40.0);
+        assert!(state.camera_x.abs() > 5.0 && state.zoom != 40.0);
         state.tour = false;
         let camera = (state.yaw, state.zoom, state.selected, state.focus);
         tour_step(&events, &mut state, 1.0);

@@ -17,7 +17,7 @@ parser.add_argument('--font', required=True)
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
 binary = root / 'target/release/systemscape'
-font = ImageFont.truetype(args.font, 15)
+font = ImageFont.truetype(args.font, 11)
 socket = 'systemscape-capture-' + uuid.uuid4().hex[:8]
 
 
@@ -26,11 +26,11 @@ def tmux(*args):
 
 
 def raster(raw, destination):
-    cell_w, cell_h, margin = 10, 21, 18
-    image = Image.new('RGB', (120 * cell_w + 2 * margin, 40 * cell_h + 2 * margin), '#101722')
+    cell_w, cell_h, margin = 7, 14, 18
+    image = Image.new('RGB', (200 * cell_w + 2 * margin, 65 * cell_h + 2 * margin), '#101722')
     draw = ImageDraw.Draw(image)
     colour = (204, 219, 235)
-    for y, line in enumerate(raw.splitlines()[:40]):
+    for y, line in enumerate(raw.splitlines()[:65]):
         x = 0
         for chunk in re.split(r'(\x1b\[[0-9;]*m)', line):
             if chunk.startswith('\x1b['):
@@ -50,7 +50,7 @@ def raster(raw, destination):
 
 
 try:
-    tmux('new-session', '-d', '-s', 'capture', '-x', '120', '-y', '40', f'{binary} --activity --demo')
+    tmux('new-session', '-d', '-s', 'capture', '-x', '200', '-y', '65', f'{binary} --activity --demo')
     time.sleep(0.6)
     for name, key in [('activity-3d', None), ('activity-flat', 'f')]:
         if key:
