@@ -84,11 +84,13 @@ impl Mark {
             .unwrap_or("")
             .to_ascii_lowercase();
         let has = |words: &[&str]| words.iter().any(|w| name.contains(w));
-        if has(&["memory"]) {
+        if has(&["todo", "plan"]) {
+            Self::Tool
+        } else if has(&["memory"]) {
             Self::Memory
         } else if has(&["web", "fetch", "browser", "perplexity", "scrape"]) {
             Self::Web
-        } else if has(&["bash", "exec", "shell"]) {
+        } else if has(&["bash", "exec", "shell", "stdin", "terminal", "command"]) {
             Self::Shell
         } else if has(&["edit", "write", "patch"]) {
             Self::Edit
@@ -148,9 +150,10 @@ struct State {
     /// Index into the day's sessions, newest first; follows `key` across updates.
     selected: usize,
     key: String,
-    day: usize,
-    /// Selected record in the flat view, 0 = newest.
-    record: usize,
+    /// The day being shown; `None` follows the newest day.
+    day: Option<String>,
+    /// Key of the selected record in the detail view; `None` is the newest.
+    record: Option<String>,
     yaw: f64,
     lift: f64,
     dolly: f64,
@@ -158,7 +161,6 @@ struct State {
     t: f64,
     tour: bool,
     dwell: f64,
-    focus: Option<Vec3D>,
     flat: bool,
     detail: bool,
     coverage: bool,
@@ -170,15 +172,14 @@ impl Default for State {
         Self {
             selected: 0,
             key: String::new(),
-            day: 0,
-            record: 0,
+            day: None,
+            record: None,
             yaw: 0.0,
             lift: 0.0,
             dolly: 1.0,
             t: 0.0,
             tour: true,
             dwell: 0.0,
-            focus: None,
             flat: false,
             detail: false,
             coverage: false,
@@ -226,7 +227,9 @@ impl Session<'_> {
 /// One day of recorded work, grouped into sessions, most recent first.
 struct City<'a> {
     day: String,
-    days: usize,
+    /// Every day with records, newest first, and the position of `day` in it.
+    days: Vec<&'a str>,
+    index: usize,
     sessions: Vec<Session<'a>>,
 }
 
@@ -244,12 +247,20 @@ fn city<'a>(events: &'a [Event], state: &mut State) -> City<'a> {
         .into_iter()
         .rev()
         .collect();
-    state.day = state.day.min(days.len().saturating_sub(1));
-    let day = days.get(state.day).copied().unwrap_or("No history");
-    let mut index: HashMap<(&str, &str), usize> = HashMap::new();
+    // A chosen day is kept by date, so a new day arriving at midnight does not
+    // shift the view; a day that has aged out of the history falls back to newest.
+    let index = match state.day.as_deref() {
+        Some(chosen) => days.iter().position(|d| *d == chosen).unwrap_or_else(|| {
+            state.day = None;
+            0
+        }),
+        None => 0,
+    };
+    let day = days.get(index).copied().unwrap_or("No history");
+    let mut by_session: HashMap<(&str, &str), usize> = HashMap::new();
     let mut sessions: Vec<Session<'a>> = Vec::new();
     for event in events.iter().filter(|e| e.at.starts_with(day)) {
-        let slot = *index
+        let slot = *by_session
             .entry((event.agent.as_str(), event.session.as_str()))
             .or_insert_with(|| {
                 sessions.push(Session {
@@ -290,7 +301,8 @@ fn city<'a>(events: &'a [Event], state: &mut State) -> City<'a> {
     }
     City {
         day: day.into(),
-        days: days.len(),
+        days,
+        index,
         sessions,
     }
 }
@@ -299,8 +311,42 @@ fn select(state: &mut State, city: &City<'_>, index: usize) {
     if let Some(session) = city.sessions.get(index) {
         state.selected = index;
         state.key = session.key();
-        state.record = 0;
+        state.record = None;
     }
+}
+
+/// Position of the selected record, counted from the newest.
+fn record_index(state: &State, session: &Session<'_>) -> usize {
+    state
+        .record
+        .as_deref()
+        .and_then(|key| session.records.iter().rev().position(|e| e.key == key))
+        .unwrap_or(0)
+}
+
+/// Move the record selection, anchored to the record's key so new records
+/// arriving at the top do not shift it.
+fn step_record(state: &mut State, session: &Session<'_>, delta: isize) {
+    let last = session.records.len().saturating_sub(1);
+    let index = record_index(state, session)
+        .saturating_add_signed(delta)
+        .min(last);
+    state.record = (index > 0).then(|| session.records[last - index].key.clone());
+}
+
+/// Show an older (+1) or newer (-1) day. At either end nothing changes.
+fn step_day(state: &mut State, city: &City<'_>, delta: isize) {
+    let Some(index) = city
+        .index
+        .checked_add_signed(delta)
+        .filter(|i| *i < city.days.len())
+    else {
+        return;
+    };
+    state.day = (index > 0).then(|| city.days[index].to_owned());
+    state.key.clear();
+    state.selected = 0;
+    state.record = None;
 }
 
 /// Tour: fly, and every few seconds move on to the next active session, or to
@@ -435,7 +481,7 @@ fn raw_height(session: &Session<'_>) -> f64 {
 /// scaling merge with their neighbours, so a tower never needs more than
 /// `TOWER_HEIGHT / MIN_BAND` floors however many records it holds. A merged
 /// floor takes the colour of its largest share, except that an error or a
-/// commit inside it always shows.
+/// commit inside it always shows (a floor holding both is split in two).
 fn bands(session: &Session<'_>, scale: f64) -> Vec<(f64, Mark)> {
     let mut out: Vec<(f64, Mark)> = Vec::new();
     let mut shares: Vec<(Mark, f64)> = Vec::new();
@@ -444,17 +490,28 @@ fn bands(session: &Session<'_>, scale: f64) -> Vec<(f64, Mark)> {
         if shares.is_empty() {
             return;
         }
-        let urgent = [Mark::Failure, Mark::Receipt]
-            .into_iter()
-            .find(|m| shares.iter().any(|(mark, _)| mark == m));
+        // An error or commit always shows; when a floor holds both, it is split.
+        let urgent: Vec<Mark> = shares
+            .iter()
+            .map(|(mark, _)| *mark)
+            .filter(|mark| matches!(mark, Mark::Failure | Mark::Receipt))
+            .collect();
         let largest = shares
             .iter()
             .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(mark, _)| *mark);
-        let mark = urgent.or(largest).unwrap_or(Mark::Tool);
-        match out.last_mut() {
-            Some((previous, same)) if *same == mark => *previous += *height,
-            _ => out.push((*height, mark)),
+            .map(|(mark, _)| *mark)
+            .unwrap_or(Mark::Tool);
+        let marks = if urgent.is_empty() {
+            vec![largest]
+        } else {
+            urgent
+        };
+        let part = *height / marks.len() as f64;
+        for mark in marks {
+            match out.last_mut() {
+                Some((previous, same)) if *same == mark => *previous += part,
+                _ => out.push((part, mark)),
+            }
         }
         *height = 0.0;
         shares.clear();
@@ -620,12 +677,33 @@ fn fit(text: &str, width: usize) -> String {
     cut
 }
 
-/// Shorten the home directory to `~` for display.
+/// Shorten the home directory to `~` for display, only where it is a whole
+/// path prefix: `/home/dev/x` becomes `~/x`, `/home/devuser/x` is untouched.
 fn tidy(text: &str) -> String {
     match std::env::var("HOME") {
-        Ok(home) if home.len() > 1 => text.replace(&home, "~"),
-        _ => text.to_owned(),
+        Ok(home) => tidy_home(text, home.trim_end_matches('/')),
+        Err(_) => text.to_owned(),
     }
+}
+
+fn tidy_home(text: &str, home: &str) -> String {
+    if home.len() < 2 {
+        return text.to_owned();
+    }
+    let path_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(home) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + home.len()..].chars().next();
+        let starts = before.is_none_or(|c| !path_char(c));
+        let ends = after.is_none_or(|c| c == '/' || !path_char(c));
+        out.push_str(&rest[..at]);
+        out.push_str(if starts && ends { "~" } else { home });
+        rest = &rest[at + home.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn short(id: &str) -> String {
@@ -734,8 +812,8 @@ fn header(canvas: &mut PixelCanvas, city: &City<'_>, state: &State, demo: bool, 
         &format!(
             "{} (day {}/{}) · {} sessions · {} projects · {} active · {}{}",
             city.day,
-            state.day + 1,
-            city.days.max(1),
+            city.index + 1,
+            city.days.len().max(1),
             city.sessions.len(),
             projects.len(),
             active,
@@ -748,6 +826,87 @@ fn header(canvas: &mut PixelCanvas, city: &City<'_>, state: &State, demo: bool, 
         ),
         MUTED,
     );
+}
+
+/// Sideways sway of the tour camera, in radians either side of `yaw`.
+const SWAY: f64 = 0.38;
+
+/// Camera aimed at the city's centre from `angle`, `distance` away.
+fn city_camera(tallest: f64, angle: f64, distance: f64, lift: f64, centre: Vec2D) -> Viewport {
+    let target = Vec3D::new(0.0, tallest * 0.3, 0.0);
+    let eye = target
+        + Vec3D::new(
+            distance * angle.sin(),
+            distance * 0.42 + lift,
+            distance * angle.cos(),
+        );
+    let mut viewport = Viewport::new(
+        Transform3D::look_at_lh(eye, target, Vec3D::NEG_Y),
+        FOV,
+        centre,
+    );
+    viewport.display_mode = DisplayMode::Solid;
+    viewport.character_width_multiplier = 1.0; // samples are square
+    viewport
+}
+
+/// Corners of everything the city draws: plates, towers and the district
+/// names in front.
+fn city_corners(lay: &Layout, tallest: f64) -> Vec<Vec3D> {
+    let (x, z) = (lay.width / 2.0, lay.depth / 2.0 + 1.6);
+    let mut corners = Vec::with_capacity(8);
+    for y in [0.0, tallest] {
+        for (cx, cz) in [(x, z), (-x, z), (x, -z), (-x, -z)] {
+            corners.push(Vec3D::new(cx, y, cz));
+        }
+    }
+    corners
+}
+
+/// The nearest camera distance at which the whole city stays inside `frame`
+/// (sample-space x0, y0, x1, y1) from every angle the sway reaches. Found by
+/// projecting the city's corners and scaling the distance by how far they
+/// overflow, which converges in a few steps.
+fn fit_distance(
+    lay: &Layout,
+    tallest: f64,
+    yaw: f64,
+    lift: f64,
+    centre: Vec2D,
+    frame: (f64, f64, f64, f64),
+) -> f64 {
+    let corners = city_corners(lay, tallest);
+    let (x0, y0, x1, y1) = frame;
+    let (cx, cy) = (f64::from(centre.x as i32), f64::from(centre.y as i32));
+    let mut widest: f64 = 12.0;
+    for angle in [yaw - SWAY, yaw, yaw + SWAY] {
+        let mut distance = 40.0_f64.max(widest);
+        for _ in 0..10 {
+            let viewport = city_camera(tallest, angle, distance, lift, centre);
+            let mut overflow: f64 = 0.0;
+            for corner in &corners {
+                let depth = viewport.camera_transform.transform_point3(*corner).z;
+                if depth <= 1.0 {
+                    overflow = overflow.max(2.0);
+                    continue;
+                }
+                let p = project(&viewport, Transform3D::IDENTITY, *corner);
+                let (px, py) = (p.x as f64, p.y as f64);
+                let ratio = |offset: f64, room: f64| offset / room.max(1.0);
+                overflow = overflow
+                    .max(ratio(cx - px, cx - x0))
+                    .max(ratio(px - cx, x1 - cx))
+                    .max(ratio(cy - py, cy - y0))
+                    .max(ratio(py - cy, y1 - cy));
+            }
+            distance *= overflow.clamp(0.5, 2.0);
+            if (overflow - 1.0).abs() < 0.01 {
+                break;
+            }
+        }
+        widest = widest.max(distance * 1.04);
+    }
+    widest
 }
 
 /// The glance view: the city, a callout on the selected tower and a strip of
@@ -772,78 +931,55 @@ fn render_city(
     let scene_bottom = rows - 1 - strip; // first row below the scene
     let (width, height) = canvas.sample_dims();
     let cell = height as i64 / rows.max(1);
-    let area = ((scene_bottom - scene_top) * cell).max(1) as f64;
-    // Distance at which a world half-extent fills half the pane, per unit.
-    let reach = 1.0 / (FOV.to_radians() / 2.0).tan();
-    let distance = |lay: &Layout| {
-        let tall = (height_cap(lay) + 0.4 * lay.depth + 4.0) / 2.0 * reach * width as f64 / area;
-        let wide = (lay.width / 2.0 + 3.0) * reach;
-        tall.max(wide).max(12.0)
+    let centre = Vec2D::new(width as i64 / 2, (scene_top + scene_bottom) * cell / 2);
+    // Keep a margin of a column either side and half a row above and below.
+    let frame = (
+        2.0 * 2.0,
+        (scene_top * cell) as f64 + 2.0,
+        width as f64 - 4.0,
+        (scene_bottom * cell) as f64 - 2.0,
+    );
+    let tallest_of = |lay: &Layout| {
+        let scale = tower_scale(city, lay);
+        lay.towers
+            .iter()
+            .map(|t| raw_height(&city.sessions[t.session]) * scale)
+            .fold(1.0, f64::max)
     };
-    // The skyline's height sets the distance; widen the city to use the pane.
+    let distance =
+        |lay: &Layout| fit_distance(lay, tallest_of(lay), state.yaw, state.lift, centre, frame);
+    // A wide pane fits a small city by its height. Stretch the city sideways as
+    // far as that costs no extra distance, so it fills the width too.
     let plain = layout(city, 1.0);
-    let spare = (distance(&plain) / reach - 3.0) / (plain.width / 2.0).max(1.0);
-    let lay = layout(city, (spare * 0.8).clamp(1.0, 2.6));
+    let closest = distance(&plain);
+    let lay = [2.6, 2.2, 1.9, 1.6, 1.35, 1.15]
+        .into_iter()
+        .map(|stretch| layout(city, stretch))
+        .find(|lay| distance(lay) <= closest * 1.03)
+        .unwrap_or(plain);
     let scale = tower_scale(city, &lay);
-    let tallest = lay
-        .towers
-        .iter()
-        .map(|t| raw_height(&city.sessions[t.session]) * scale)
-        .fold(1.0, f64::max);
+    let tallest = tallest_of(&lay);
     let selected_top = lay
         .towers
         .iter()
         .find(|t| t.session == state.selected)
         .map(|t| Vec3D::new(t.x, raw_height(&city.sessions[t.session]) * scale, t.z));
 
-    // The camera sways in front of the city and leans towards the selection.
-    let centre = Vec3D::new(0.0, tallest * 0.3, 0.0);
-    let wanted = selected_top.map_or(centre, |top| {
-        centre.lerp(Vec3D::new(top.x, centre.y, top.z), 0.3)
-    });
-    let target = match state.focus {
-        Some(previous) if state.tour => previous.lerp(wanted, 0.1),
-        _ => wanted,
-    };
-    state.focus = Some(target);
+    // The camera sways in front of the city, always aimed at its centre.
     let radius = distance(&lay) * state.dolly;
-    let angle = state.yaw + 0.38 * (state.t * 0.11).sin();
-    let eye = target
-        + Vec3D::new(
-            radius * angle.sin(),
-            radius * 0.42 + state.lift + 2.0 * (state.t * 0.17).sin(),
-            radius * angle.cos(),
-        );
-    let mut viewport = Viewport::new(
-        Transform3D::look_at_lh(eye, target, Vec3D::NEG_Y),
-        FOV,
-        Vec2D::new(width as i64 / 2, (scene_top + scene_bottom) * cell / 2),
-    );
-    viewport.display_mode = DisplayMode::Solid;
-    viewport.character_width_multiplier = 1.0; // samples are square
+    let angle = state.yaw + SWAY * (state.t * 0.11).sin();
+    let viewport = city_camera(tallest, angle, radius, state.lift, centre);
     let (ground, towers) = build_scene(city, &lay, state.selected, state.t, now);
+    let mut viewport = viewport;
     for mesh in [ground, towers] {
         viewport.objects = vec![clip_scene(mesh, &viewport, (width, height))];
         gemini_engine::core::CanDraw::draw_to(&viewport, &mut canvas);
     }
     let at = |point: Vec3D| PixelCanvas::cell_of(project(&viewport, Transform3D::IDENTITY, point));
 
-    // District names along the front edge. Alternate districts drop a row, so
-    // a name may run on under its neighbour as far as the district after that.
-    let fronts: Vec<(i64, i64)> = lay
-        .districts
-        .iter()
-        .map(|d| at(Vec3D::new(d.left, 0.0, lay.depth / 2.0 + 1.2)))
-        .collect();
-    for (i, district) in lay.districts.iter().enumerate() {
-        let (left, row) = fronts[i];
-        let limit = fronts.get(i + 2).map_or(columns, |next| next.0 - 1);
-        let name = fit(&district.name, (limit - left).max(0) as usize);
-        let row = (row + (i % 2) as i64).clamp(scene_top, scene_bottom - 1);
-        canvas.label(left, row, &name, BRIGHT);
-    }
-
-    // Callout tethered to the selected tower.
+    // Callout tethered to the selected tower, placed first so district names
+    // can keep clear of it.
+    let mut callout: Option<(i64, i64, i64)> = None; // column, row, width
     if let (Some(top), Some(session)) = (selected_top, city.sessions.get(state.selected)) {
         let (col, row) = at(top);
         let newest = session.newest();
@@ -877,6 +1013,32 @@ fn render_city(
         canvas.label(col + 4, row, &lines[0], BRIGHT);
         canvas.label(col + 4, row + 1, &lines[1], Mark::of(newest).hue());
         canvas.label(col + 4, row + 2, &lines[2], MUTED);
+        callout = Some((col, row, longest + 4));
+    }
+
+    // District names along the front edge. Alternate districts drop a row, so
+    // a name may run on under its neighbour as far as the district after that.
+    // A name the callout covers moves down a row, or is left out.
+    let covered = |col: i64, row: i64, len: i64| {
+        callout.is_some_and(|(c, r, w)| row >= r && row < r + 3 && col < c + w && col + len > c)
+    };
+    let fronts: Vec<(i64, i64)> = lay
+        .districts
+        .iter()
+        .map(|d| at(Vec3D::new(d.left, 0.0, lay.depth / 2.0 + 1.2)))
+        .collect();
+    for (i, district) in lay.districts.iter().enumerate() {
+        let (left, row) = fronts[i];
+        let limit = fronts.get(i + 2).map_or(columns, |next| next.0 - 1);
+        let name = fit(&district.name, (limit - left).max(0) as usize);
+        let len = name.chars().count() as i64;
+        let row = (row + (i % 2) as i64).clamp(scene_top, scene_bottom - 1);
+        let row = [row, row + 1, row + 2]
+            .into_iter()
+            .find(|r| *r < scene_bottom && !covered(left, *r, len));
+        if let Some(row) = row {
+            canvas.label(left, row, &name, BRIGHT);
+        }
     }
 
     header(&mut canvas, city, state, demo, now);
@@ -1052,9 +1214,9 @@ fn render_flat(
     );
 
     // Records of the selected session, newest first.
-    state.record = state.record.min(session.records.len() - 1);
+    let chosen_record = record_index(state, session);
     let space = (rows - below - 5).max(1) as usize;
-    let first = (state.record + 1).saturating_sub(space);
+    let first = (chosen_record + 1).saturating_sub(space);
     for (line, (i, record)) in session
         .records
         .iter()
@@ -1066,7 +1228,7 @@ fn render_flat(
     {
         let row = below + 1 + line as i64;
         let mark = Mark::of(record);
-        let chosen = i == state.record;
+        let chosen = i == chosen_record;
         canvas.label(0, row, if chosen { ">" } else { " " }, GOLD);
         canvas.label(2, row, record.at.get(11..19).unwrap_or("?"), MUTED);
         canvas.label(11, row, mark.name(), mark.hue());
@@ -1083,7 +1245,7 @@ fn render_flat(
     }
 
     // Full text of the selected record, wrapped over two lines, then where it came from.
-    let record = session.records[session.records.len() - 1 - state.record];
+    let record = session.records[session.records.len() - 1 - chosen_record];
     let wide = columns.saturating_sub(2).max(1);
     let text: Vec<char> = record.text.chars().collect();
     for (line, chunk) in text.chunks(wide).take(2).enumerate() {
@@ -1240,35 +1402,19 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let mut next_poll = Instant::now() + POLL;
     let mut dirty = true;
     let mut drawn = Instant::now();
-    let mut focused = crate::starts_focused();
+    let mut sight = crate::Sight::new();
     let mut buffer = crate::FrameBuffer::default();
     let mut last_frame = Instant::now();
     loop {
-        // An unfocused tab does no work at all: no file polling, no rendering.
-        // The transcripts are append-only logs read from a saved offset, so
-        // everything written meanwhile is picked up on the next focused poll.
-        // The first frame is always drawn, so a background tab is never blank.
-        if !focused && !dirty {
-            last_frame = Instant::now();
-            match event::read()? {
-                Input::FocusGained => {
-                    focused = true;
-                    dirty = true;
-                    next_poll = Instant::now();
-                }
-                Input::Key(key)
-                    if key.kind != KeyEventKind::Release
-                        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                            || key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)) =>
-                {
-                    return Ok(());
-                }
-                _ => (),
-            }
-            continue;
+        if sight.tick() {
+            dirty = true;
+            next_poll = Instant::now();
         }
-        if !demo && Instant::now() >= next_poll {
+        let visible = sight.visible();
+        // Off screen, the view neither polls nor draws. The transcripts are
+        // append-only logs read from a saved offset, so everything written
+        // meanwhile is picked up by the first poll once it is shown again.
+        if visible && !demo && Instant::now() >= next_poll {
             collector.poll();
             let updated = collector.rows();
             let new_coverage = collector.coverage();
@@ -1278,19 +1424,24 @@ pub fn run(args: &[String]) -> io::Result<()> {
             next_poll = Instant::now() + POLL;
         }
         let now = unix_now();
-        if last_frame.elapsed() >= Duration::from_millis(FRAME_MS) {
-            tour_step(&events, &mut state, last_frame.elapsed().as_secs_f64(), now);
+        let dims = crate::term_dims();
+        let in_list = state.flat || dims.0 < 80 || dims.1 < 20;
+        // The tour animates only while the view has the keyboard. Visible but
+        // unfocused, it stays current and redraws twice a second.
+        let flying = sight.focused() && state.tour && !in_list;
+        if visible && last_frame.elapsed() >= Duration::from_millis(FRAME_MS) {
+            let dt = if flying {
+                last_frame.elapsed().as_secs_f64()
+            } else {
+                0.0
+            };
+            tour_step(&events, &mut state, dt, now);
             last_frame = Instant::now();
         }
-        let dims = crate::term_dims();
-        // Holding still, the picture only changes with new records, input or
-        // the beacons and ages, so redraw twice a second instead of every frame.
-        let flying = state.tour && !state.flat && dims.0 >= 80 && dims.1 >= 20;
-        if dirty || flying || buffer.dims != dims || drawn.elapsed() >= Duration::from_millis(500) {
-            if !flying {
-                state.t +=
-                    drawn.elapsed().as_secs_f64().min(0.5) * f64::from(u8::from(!state.tour));
-            }
+        // A new or resized pane is always drawn once, so it is never blank.
+        if buffer.dims != dims
+            || visible && (dirty || flying || drawn.elapsed() >= Duration::from_millis(500))
+        {
             buffer.present_rows(
                 render(&events, &coverage, &mut state, dims, demo, now),
                 dims,
@@ -1298,12 +1449,25 @@ pub fn run(args: &[String]) -> io::Result<()> {
             dirty = false;
             drawn = Instant::now();
         }
-        if !event::poll(Duration::from_millis(FRAME_MS))? {
+        let wait = match (visible, flying) {
+            (false, _) => Duration::from_secs(2),
+            (true, true) => Duration::from_millis(FRAME_MS),
+            (true, false) => Duration::from_millis(250),
+        };
+        if !event::poll(wait)? {
             continue;
         }
         match event::read()? {
             Input::Resize(..) => dirty = true,
-            Input::FocusLost => focused = false,
+            Input::FocusGained => {
+                if sight.focus(true) {
+                    next_poll = Instant::now(); // catch up straight away
+                }
+                dirty = true;
+            }
+            Input::FocusLost => {
+                sight.focus(false);
+            }
             Input::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1316,18 +1480,29 @@ pub fn run(args: &[String]) -> io::Result<()> {
                     state.tour = false;
                 }
                 let city = city(&events, &mut state);
-                let count = city.sessions.len();
-                let step = |state: &mut State, city: &City<'_>, forward: bool| {
+                // In the city, only drawn towers can be selected.
+                let count = if in_list {
+                    city.sessions.len()
+                } else {
+                    city.sessions.len().min(MAX_TOWERS)
+                };
+                let step = |state: &mut State, forward: bool| {
                     if count > 0 {
+                        let current = state.selected.min(count - 1);
                         let next = if forward {
-                            (state.selected + 1) % count
+                            (current + 1) % count
                         } else {
-                            (state.selected + count - 1) % count
+                            (current + count - 1) % count
                         };
-                        select(state, city, next);
+                        select(state, &city, next);
                     }
                 };
-                let in_list = state.flat || dims.0 < 80 || dims.1 < 20;
+                let session = city.sessions.get(state.selected);
+                let records = |state: &mut State, delta: isize| {
+                    if let Some(session) = session {
+                        step_record(state, session, delta);
+                    }
+                };
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char(' ') => {
@@ -1343,22 +1518,14 @@ pub fn run(args: &[String]) -> io::Result<()> {
                     }
                     KeyCode::Char('-') => state.dolly = (state.dolly * 1.1).min(3.0),
                     KeyCode::Char('0') => (state.yaw, state.lift, state.dolly) = (0.0, 0.0, 1.0),
-                    KeyCode::Char('j') if in_list => state.record = state.record.saturating_add(1),
-                    KeyCode::Char('k') if in_list => state.record = state.record.saturating_sub(1),
-                    KeyCode::PageDown => state.record = state.record.saturating_add(10),
-                    KeyCode::PageUp => state.record = state.record.saturating_sub(10),
-                    KeyCode::Char('j') | KeyCode::Tab => step(&mut state, &city, true),
-                    KeyCode::Char('k') | KeyCode::BackTab => step(&mut state, &city, false),
-                    KeyCode::Char('[') | KeyCode::Char(']') => {
-                        state.day = if key.code == KeyCode::Char('[') {
-                            state.day.saturating_add(1)
-                        } else {
-                            state.day.saturating_sub(1)
-                        };
-                        state.key.clear();
-                        state.selected = 0;
-                        state.record = 0;
-                    }
+                    KeyCode::Char('j') if in_list => records(&mut state, 1),
+                    KeyCode::Char('k') if in_list => records(&mut state, -1),
+                    KeyCode::PageDown => records(&mut state, 10),
+                    KeyCode::PageUp => records(&mut state, -10),
+                    KeyCode::Char('j') | KeyCode::Tab => step(&mut state, true),
+                    KeyCode::Char('k') | KeyCode::BackTab => step(&mut state, false),
+                    KeyCode::Char('[') => step_day(&mut state, &city, 1),
+                    KeyCode::Char(']') => step_day(&mut state, &city, -1),
                     KeyCode::Char('f') => state.flat = !state.flat,
                     KeyCode::Enter if in_list => state.detail = !state.detail,
                     KeyCode::Enter => state.flat = true,
@@ -1421,6 +1588,9 @@ mod tests {
             ("mcp__claude-flow__memory_search focus", Mark::Memory),
             ("Agent review the diff", Mark::Agent),
             ("update_plan", Mark::Tool),
+            ("write_stdin session 3", Mark::Shell),
+            ("TodoWrite", Mark::Tool),
+            ("Write docs/a.md", Mark::Edit),
             ("", Mark::Tool),
         ] {
             assert_eq!(Mark::of_tool(text), mark, "{text}");
@@ -1436,7 +1606,7 @@ mod tests {
         ];
         let mut state = State::default();
         let built = city(&events, &mut state);
-        assert_eq!((built.days, built.sessions.len()), (2, 2));
+        assert_eq!((built.days.len(), built.sessions.len()), (2, 2));
         assert_eq!(built.sessions[0].id, "new");
         select(&mut state, &built, 0);
         // The other session records newer work and overtakes it.
@@ -1595,7 +1765,7 @@ mod tests {
         assert!(text.contains(&format!("{} records", chosen.records.len())));
         assert!(text.contains("Project:"));
         state.detail = true;
-        state.record = usize::MAX; // clamps to the oldest record
+        step_record(&mut state, chosen, isize::MAX); // clamps to the oldest record
         let text = plain(&render(
             &events,
             "fixture",
@@ -1605,7 +1775,7 @@ mod tests {
             now,
         ));
         assert!(text.contains("Source: synthetic demo"));
-        assert_eq!(state.record, chosen.records.len() - 1);
+        assert_eq!(record_index(&state, chosen), chosen.records.len() - 1);
         assert!(text.contains(chosen.records[0].at.get(11..19).unwrap()));
         // Small panes get the same list rather than a cramped city.
         let small = plain(&render(
@@ -1696,5 +1866,179 @@ mod tests {
                 assert!((-1..=201).contains(&p.x) && (-1..=66).contains(&p.y));
             }
         }
+    }
+
+    #[test]
+    fn the_whole_city_stays_in_frame_at_every_size_sway_and_selection() {
+        let many: Vec<_> = (0..60)
+            .map(|i| {
+                let at = format!("2026-01-02T10:{:02}:00.000Z", i % 60);
+                let mut e = event(i, &at, &format!("s{i}"), "tool", "Read");
+                e.project = format!("/work/p{}", i % 12);
+                e
+            })
+            .collect();
+        let few: Vec<_> = (0..3)
+            .map(|i| {
+                let at = format!("2026-01-02T10:0{i}:00.000Z");
+                event(i, &at, &format!("s{i}"), "tool", "Bash x")
+            })
+            .collect();
+        for events in [demo_events(), many, few] {
+            for dims in [
+                (80usize, 20usize),
+                (120, 38),
+                (165, 35),
+                (100, 60),
+                (90, 180),
+                (512, 180),
+            ] {
+                for selected in [0, 2] {
+                    // t = 14.28 and 42.8 put the sway near its two extremes.
+                    for t in [0.0, 14.28, 42.8] {
+                        let mut state = State {
+                            t,
+                            ..State::default()
+                        };
+                        let built = city(&events, &mut state);
+                        select(&mut state, &built, selected.min(built.sessions.len() - 1));
+                        let rows = render(&events, "fixture", &mut state, dims, false, 0.0);
+                        assert_eq!(rows.len(), dims.1);
+                        // Re-derive the camera exactly as render_city does.
+                        let strip = (built.sessions.len().min(5) as i64 + 1).min(dims.1 as i64 / 3);
+                        let bottom = dims.1 as i64 - 1 - strip;
+                        let canvas = PixelCanvas::new(dims.0, dims.1, PANEL, PANEL);
+                        let (width, height) = canvas.sample_dims();
+                        let cell = height as i64 / dims.1 as i64;
+                        let centre = Vec2D::new(width as i64 / 2, (2 + bottom) * cell / 2);
+                        let frame = (
+                            4.0,
+                            (2 * cell) as f64 + 2.0,
+                            width as f64 - 4.0,
+                            (bottom * cell) as f64 - 2.0,
+                        );
+                        let tallest_of = |lay: &Layout| {
+                            let scale = tower_scale(&built, lay);
+                            lay.towers
+                                .iter()
+                                .map(|t| raw_height(&built.sessions[t.session]) * scale)
+                                .fold(1.0, f64::max)
+                        };
+                        let fit = |lay: &Layout| {
+                            fit_distance(lay, tallest_of(lay), 0.0, 0.0, centre, frame)
+                        };
+                        let plain_layout = layout(&built, 1.0);
+                        let closest = fit(&plain_layout);
+                        let lay = [2.6, 2.2, 1.9, 1.6, 1.35, 1.15]
+                            .into_iter()
+                            .map(|s| layout(&built, s))
+                            .find(|lay| fit(lay) <= closest * 1.03)
+                            .unwrap_or(plain_layout);
+                        let tallest = tallest_of(&lay);
+                        let angle = SWAY * (t * 0.11).sin();
+                        let viewport = city_camera(tallest, angle, fit(&lay), 0.0, centre);
+                        for corner in city_corners(&lay, tallest) {
+                            let p = project(&viewport, Transform3D::IDENTITY, corner);
+                            assert!(
+                                p.x >= 0
+                                    && p.x <= width as i64
+                                    && p.y >= 2 * cell
+                                    && p.y <= bottom * cell,
+                                "{dims:?} t {t} corner {corner:?} at {p:?} outside {width}x{}",
+                                bottom * cell
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn days_are_kept_by_date_and_records_by_key() {
+        let mut events = vec![
+            event(0, "2026-01-01T10:00:00.000Z", "a", "prompt", "old day"),
+            event(1, "2026-01-02T10:00:00.000Z", "b", "tool", "Read 1"),
+            event(2, "2026-01-02T10:01:00.000Z", "b", "tool", "Read 2"),
+            event(3, "2026-01-02T10:02:00.000Z", "b", "tool", "Read 3"),
+        ];
+        let mut state = State::default();
+        let built = city(&events, &mut state);
+        assert_eq!(built.day, "2026-01-02");
+        step_day(&mut state, &built, -1); // already newest: nothing changes
+        assert_eq!(state.day, None);
+        step_day(&mut state, &built, 1);
+        assert_eq!(state.day.as_deref(), Some("2026-01-01"));
+        // A new day arrives at midnight; the chosen day stays put.
+        events.push(event(
+            4,
+            "2026-01-03T00:00:01.000Z",
+            "c",
+            "tool",
+            "Read new",
+        ));
+        let built = city(&events, &mut state);
+        assert_eq!((built.day.as_str(), built.index), ("2026-01-01", 2));
+        step_day(&mut state, &built, 1); // already oldest
+        assert_eq!(state.day.as_deref(), Some("2026-01-01"));
+        step_day(&mut state, &built, -2);
+        assert_eq!(state.day, None, "back to following the newest day");
+
+        // Records: select the second newest, then newer records arrive.
+        state.day = Some("2026-01-02".into());
+        let built = city(&events, &mut state);
+        let session = &built.sessions[0];
+        step_record(&mut state, session, 1);
+        assert_eq!(state.record.as_deref(), Some("00002"));
+        step_record(&mut state, session, 99);
+        assert_eq!(
+            state.record.as_deref(),
+            Some("00001"),
+            "clamped to the oldest"
+        );
+        step_record(&mut state, session, -99);
+        assert_eq!(state.record, None, "newest");
+        step_record(&mut state, session, 1);
+        events.push(event(5, "2026-01-02T10:03:00.000Z", "b", "tool", "Read 4"));
+        let built = city(&events, &mut state);
+        assert_eq!(
+            record_index(&state, &built.sessions[0]),
+            2,
+            "selection stays on its record"
+        );
+    }
+
+    #[test]
+    fn home_is_shortened_only_as_a_whole_path_prefix() {
+        assert_eq!(tidy_home("Read /home/dev/x.rs", "/home/dev"), "Read ~/x.rs");
+        assert_eq!(tidy_home("cd /home/dev", "/home/dev"), "cd ~");
+        assert_eq!(
+            tidy_home("Read /home/devuser/x", "/home/dev"),
+            "Read /home/devuser/x"
+        );
+        assert_eq!(tidy_home("/srv/home/dev/x", "/home/dev"), "/srv/home/dev/x");
+        assert_eq!(tidy_home("a=/home/dev/b c", "/home/dev"), "a=~/b c");
+    }
+
+    #[test]
+    fn a_merged_floor_with_an_error_and_a_commit_shows_both() {
+        let events: Vec<_> = (0..4)
+            .map(|i| {
+                let kind = ["failure", "receipt", "tool", "tool"][i];
+                event(
+                    i,
+                    &format!("2026-01-02T10:00:0{i}.000Z"),
+                    "s",
+                    kind,
+                    "Read x",
+                )
+            })
+            .collect();
+        let built = city(&events, &mut State::default());
+        let floors = bands(&built.sessions[0], 0.1); // everything merges into one floor
+        let marks: Vec<Mark> = floors.iter().map(|(_, m)| *m).collect();
+        assert_eq!(marks, vec![Mark::Failure, Mark::Receipt]);
+        let total: f64 = floors.iter().map(|(h, _)| h).sum();
+        assert!((total - (0.4 + 0.4 + 0.5 + 0.5) * 0.1).abs() < 1e-9);
     }
 }

@@ -64,6 +64,13 @@ def raster(raw, destination):
 
 try:
     tmux('new-session', '-d', '-s', 'capture', '-x', '200', '-y', '65', f'{binary} --activity --demo')
+    # A control-mode client makes the pane count as on screen, so views keep
+    # drawing; a fixed window size stops the client resizing the capture.
+    tmux('set', '-g', 'window-size', 'manual')
+    client = subprocess.Popen(['tmux', '-L', socket, '-C', 'attach', '-t', 'capture'],
+                              stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    tmux('resize-window', '-t', 'capture:0', '-x', '200', '-y', '65')
     time.sleep(1.0)
     tmux('send-keys', '-t', 'capture:0', 'Space')
     time.sleep(0.4)

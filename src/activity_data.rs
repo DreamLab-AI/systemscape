@@ -152,7 +152,8 @@ fn tool_detail(input: &Value) -> String {
     String::new()
 }
 
-/// First quoted string in a snippet of code, without its quotes.
+/// First line of the first quoted string in a snippet of code, with its
+/// escapes decoded: a JavaScript `"cd x\nls"` gives `cd x`.
 fn first_literal(code: &str) -> String {
     let Some(start) = code.find(['"', '\'', '`']) else {
         return String::new();
@@ -162,7 +163,12 @@ fn first_literal(code: &str) -> String {
     let mut chars = code[start + 1..].chars();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => out.extend(chars.next()),
+            '\\' => match chars.next() {
+                Some('n' | 'r') | None => break,
+                Some('t') => out.push(' '),
+                Some(other) => out.push(other),
+            },
+            '\n' => break,
             c if c == quote => break,
             c => out.push(c),
         }
@@ -1052,6 +1058,14 @@ mod tests {
             call(serde_json::json!({"name":"exec","input":"1 + 1"})),
             "exec 1 + 1"
         );
+        assert_eq!(
+            call(serde_json::json!({
+                "name": "exec",
+                "input": "tools.exec_command({cmd:\"python - <<'PY'\\nfrom x import y\\nPY\"})"
+            })),
+            "exec_command python - <<'PY'"
+        );
+        assert_eq!(first_literal("f(`a\\tb`)"), "a b");
         assert_eq!(
             call(
                 serde_json::json!({"name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls\"]}"})

@@ -20,9 +20,10 @@ use std::time::{Duration, Instant};
 
 const FRAME_MS: u64 = 55; // ~18 FPS
 const POLL: Duration = Duration::from_secs(2);
-/// Sensor interval while the tab is in the background: enough to keep the
-/// two-hour history unbroken, a fifth of the cost.
-const BACKGROUND_POLL: Duration = Duration::from_secs(10);
+/// GPU query interval while the view is off screen. The cheap /proc and hwmon
+/// sensors keep their two-second pace so rates and peaks are not diluted;
+/// nvidia-smi, the costly one, runs a fifth as often.
+const BACKGROUND_GPU_POLL: Duration = Duration::from_secs(10);
 const SLOT_SECS: f64 = 150.0; // one history slot per 150s
 const HISTORY: usize = 48; // 48 × 150s = 2h end to end
 const RELIEF: f64 = 5.0; // world height of a full-scale value
@@ -319,7 +320,7 @@ fn query_gpus() -> Vec<Gpu> {
     }
 }
 
-fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState) -> Snapshot {
+fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState, gpus: bool) -> Snapshot {
     let mut s = Snapshot::default();
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         let mut hwmons: Vec<_> = entries.flatten().map(|e| e.path()).collect();
@@ -363,7 +364,9 @@ fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState) -> Snapshot {
         }
     }
 
-    s.gpus = query_gpus();
+    if gpus {
+        s.gpus = query_gpus();
+    }
 
     // CPU busy % from /proc/stat deltas
     if let Ok(stat) = fs::read_to_string("/proc/stat") {
@@ -889,18 +892,26 @@ fn render(
 pub fn run(demo: bool) -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel();
     // nvidia-smi takes tens of milliseconds; polling off-thread keeps frames even.
-    let focused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(crate::starts_focused()));
-    let sensor_focus = focused.clone();
+    let on_screen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sensor_sight = on_screen.clone();
     let sensors = std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
         let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
-        while tx.send(poll_sensors(&mut prev_cpu, &mut rates)).is_ok() {
-            // `unpark` on regaining focus cuts a background wait short.
-            std::thread::park_timeout(if sensor_focus.load(Ordering::Relaxed) {
-                POLL
-            } else {
-                BACKGROUND_POLL
-            });
+        let mut gpu_at: Option<Instant> = None;
+        loop {
+            let gpus = sensor_sight.load(Ordering::Relaxed)
+                || gpu_at.is_none_or(|at| at.elapsed() >= BACKGROUND_GPU_POLL);
+            if gpus {
+                gpu_at = Some(Instant::now());
+            }
+            if tx
+                .send(poll_sensors(&mut prev_cpu, &mut rates, gpus))
+                .is_err()
+            {
+                break;
+            }
+            // `unpark` when the view comes back on screen cuts the wait short.
+            std::thread::park_timeout(POLL);
         }
     });
     // Start even if the first poll is slow; late cards join via `ensure_cards`.
@@ -914,6 +925,7 @@ pub fn run(demo: bool) -> std::io::Result<()> {
     }
 
     let _terminal = crate::Terminal::enter()?;
+    let mut sight = crate::Sight::new();
     let mut buffer = crate::FrameBuffer::default();
     let mut camera = Camera::default();
     let mut flat = false;
@@ -940,17 +952,27 @@ pub fn run(demo: bool) -> std::io::Result<()> {
             // count one spike in two slots.
             dirty = true;
         }
-        if camera.fly {
+        let back = sight.tick();
+        let visible = sight.visible();
+        if back || visible != on_screen.load(std::sync::atomic::Ordering::Relaxed) {
+            on_screen.store(visible, std::sync::atomic::Ordering::Relaxed);
+            if visible {
+                sensors.thread().unpark(); // fresh readings straight away
+                dirty = true;
+            }
+        }
+        // The flight animates only while the view has the keyboard; visible
+        // but unfocused it holds still and redraws twice a second.
+        let flying = camera.fly && sight.focused();
+        if flying {
             camera.t += last_frame.elapsed().as_secs_f64().min(0.25);
         }
         last_frame = Instant::now();
         let dims = crate::term_dims();
-        let in_focus = focused.load(std::sync::atomic::Ordering::Relaxed);
-        // In the background nothing is drawn; history keeps filling from the
-        // slower sensor polls, ready for the moment the tab is shown again.
-        // A new or resized pane is always drawn once, so it is never blank.
+        // Off screen nothing is drawn; history keeps filling from the sensor
+        // thread. A new or resized pane is always drawn once, so it is never blank.
         if buffer.dims != dims
-            || in_focus && (camera.fly || dirty || drawn.elapsed() >= Duration::from_millis(500))
+            || visible && (flying || dirty || drawn.elapsed() >= Duration::from_millis(500))
         {
             let scroll = slot_started.elapsed().as_secs_f64() / SLOT_SECS;
             buffer.present_rows(
@@ -961,23 +983,22 @@ pub fn run(demo: bool) -> std::io::Result<()> {
             drawn = Instant::now();
         }
 
-        // A background tab wakes once a second, only to file sensor readings.
-        let budget = if in_focus {
-            Duration::from_millis(FRAME_MS).saturating_sub(frame_started.elapsed())
-        } else {
-            Duration::from_secs(1)
+        // Off screen the loop wakes once a second, only to file sensor readings.
+        let budget = match (visible, flying) {
+            (false, _) => Duration::from_secs(1),
+            (true, true) => Duration::from_millis(FRAME_MS).saturating_sub(frame_started.elapsed()),
+            (true, false) => Duration::from_millis(250),
         };
         if !event::poll(budget)? {
             continue;
         }
         let input = event::read()?;
-        if matches!(input, Event::FocusGained | Event::FocusLost) {
-            let gained = input == Event::FocusGained;
-            focused.store(gained, std::sync::atomic::Ordering::Relaxed);
-            if gained {
-                sensors.thread().unpark(); // fresh readings straight away
-                dirty = true;
+        if let Event::FocusGained | Event::FocusLost = input {
+            if sight.focus(input == Event::FocusGained) {
+                on_screen.store(true, std::sync::atomic::Ordering::Relaxed);
+                sensors.thread().unpark();
             }
+            dirty = true;
         }
         if let Event::Key(key) = input {
             if key.kind == KeyEventKind::Release {

@@ -54,37 +54,92 @@ impl Drop for Terminal {
     }
 }
 
-/// Whether this pane is on screen at start-up. Terminals report focus only
-/// when it changes, so a view launched in a background tmux window would
-/// otherwise run at full rate until first visited. Outside tmux, or when tmux
-/// will not report focus changes, assume focused.
-fn starts_focused() -> bool {
-    let Some(pane) = std::env::var_os("TMUX_PANE") else {
-        return true;
-    };
-    let tmux = |args: &[&std::ffi::OsStr]| {
-        std::process::Command::new("tmux")
-            .args(args)
+/// Whether a view is on screen, and whether it has the keyboard.
+///
+/// In tmux, "visible" means the pane's window is the current window of an
+/// attached session: a pane beside the active one in a split is visible but
+/// not focused. tmux is asked every two seconds; focus reports from the
+/// terminal update the state at once in between. Outside tmux a view is
+/// always treated as visible, and focus reports only change its pace.
+pub(crate) struct Sight {
+    pane: Option<std::ffi::OsString>,
+    visible: bool,
+    focused: bool,
+    checked: std::time::Instant,
+}
+
+impl Sight {
+    pub(crate) fn new() -> Self {
+        let mut sight = Self {
+            pane: std::env::var_os("TMUX_PANE"),
+            visible: true,
+            focused: true,
+            checked: std::time::Instant::now(),
+        };
+        sight.ask_tmux();
+        sight
+    }
+
+    /// On screen: keep data current and draw it.
+    pub(crate) fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// On screen and receiving keys: animate at full rate.
+    pub(crate) fn focused(&self) -> bool {
+        self.visible && self.focused
+    }
+
+    /// Re-ask tmux when the last answer is two seconds old. Returns true
+    /// when the view has just come back on screen.
+    pub(crate) fn tick(&mut self) -> bool {
+        if self.pane.is_none() || self.checked.elapsed() < std::time::Duration::from_secs(2) {
+            return false;
+        }
+        let was = self.visible;
+        self.ask_tmux();
+        !was && self.visible
+    }
+
+    /// Apply a focus report. Returns true when the view has just come back on screen.
+    pub(crate) fn focus(&mut self, gained: bool) -> bool {
+        let was = self.visible;
+        self.focused = gained;
+        if gained {
+            self.visible = true; // only a visible pane can take focus
+        }
+        !was && self.visible
+    }
+
+    fn ask_tmux(&mut self) {
+        self.checked = std::time::Instant::now();
+        let Some(pane) = &self.pane else { return };
+        let answer = std::process::Command::new("tmux")
+            .arg("display-message")
+            .arg("-p")
+            .arg("-t")
+            .arg(pane)
+            .arg("#{window_active} #{pane_active} #{session_attached}")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
             .ok()
             .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    };
-    let reports = tmux(&[
-        "show-options".as_ref(),
-        "-gv".as_ref(),
-        "focus-events".as_ref(),
-    ]);
-    let active = tmux(&[
-        "display-message".as_ref(),
-        "-p".as_ref(),
-        "-t".as_ref(),
-        pane.as_ref(),
-        "#{window_active}#{pane_active}".as_ref(),
-    ]);
-    !(reports.as_deref() == Some("on") && active.is_some_and(|state| state != "11"))
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+        // If tmux cannot answer, keep the last state rather than guess.
+        if let Some((visible, focused)) = answer.as_deref().and_then(parse_tmux_sight) {
+            self.visible = visible;
+            self.focused = focused;
+        }
+    }
+}
+
+/// Parse `"<window_active> <pane_active> <session_attached>"`.
+fn parse_tmux_sight(answer: &str) -> Option<(bool, bool)> {
+    let mut fields = answer.split_whitespace();
+    let (window, pane, clients) = (fields.next()?, fields.next()?, fields.next()?);
+    let visible = window == "1" && clients.parse::<u32>().ok()? > 0;
+    Some((visible, visible && pane == "1"))
 }
 
 fn term_dims() -> (usize, usize) {
@@ -127,7 +182,7 @@ impl FrameBuffer {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("systemscape {}\n\nUsage: systemscape [--demo]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.\n           Space holds/resumes flight, arrows steer, +/- zoom, 0 reset, f flat view, q quits.\nActivity: a city of recorded work. District = project, tower = session, floor = action.\n          Space follows live work or holds, j/k session, Enter or f detail view (j/k record,\n          Enter source), [/] day, arrows steer, +/- zoom, 0 reset, h strip, ? sources, q quits.\nBoth views stop drawing while their terminal tab is not focused.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
+        println!("systemscape {}\n\nUsage: systemscape [--demo]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.\n           Space holds/resumes flight, arrows steer, +/- zoom, 0 reset, f flat view, q quits.\nActivity: a city of recorded work. District = project, tower = session, floor = action.\n          Space follows live work or holds, j/k session, Enter or f detail view (j/k record,\n          Enter source), [/] day, arrows steer, +/- zoom, 0 reset, h strip, ? sources, q quits.\nBoth views pause while their tmux window is not on screen, and slow down while visible but unfocused.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -148,5 +203,26 @@ fn main() {
     if let Err(error) = telemetry::run(args.iter().any(|a| a == "--demo")) {
         eprintln!("systemscape: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tmux_sight_separates_visible_from_focused() {
+        use super::parse_tmux_sight as parse;
+        assert_eq!(parse("1 1 1\n"), Some((true, true)));
+        assert_eq!(
+            parse("1 0 2"),
+            Some((true, false)),
+            "split pane beside the active one"
+        );
+        assert_eq!(
+            parse("0 1 1"),
+            Some((false, false)),
+            "another window is current"
+        );
+        assert_eq!(parse("1 1 0"), Some((false, false)), "no client attached");
+        assert_eq!(parse("garbage"), None);
     }
 }

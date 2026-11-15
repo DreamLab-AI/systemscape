@@ -123,12 +123,16 @@ every two seconds and discovers files every 30 seconds. It reads at most 1 MiB
 per file and 8 MiB per poll, tracks at most 256 files and keeps the newest
 5,000 records, dropping the oldest first.
 
-**Background tabs do no work.** Both views ask the terminal for focus reports.
-While its tab is not on screen the activity view neither polls nor draws, and
-catches up from the saved offsets when shown again. Telemetry stops drawing and
-samples its sensors every ten seconds instead of two, so the two-hour history
-stays unbroken. In tmux this needs `set -g focus-events on`; without focus
-reports the views run as if always visible. While the tour is held, the view
+**Background tabs do no work.** In tmux, a view is on screen when its window
+is the current window of an attached session. Off screen, the activity view
+neither polls nor draws, and catches up from the saved offsets when shown
+again; telemetry stops drawing but keeps sampling, querying `nvidia-smi` every
+ten seconds instead of two, so its two-hour history has no gaps. A view that is
+on screen but not focused, for example beside the active pane in a split,
+stays current but holds its camera and redraws twice a second. Visibility is
+checked with tmux every two seconds, and focus reports (`set -g focus-events
+on`) make changes immediate. Outside tmux a view is always treated as on
+screen. While the tour is held, the view
 redraws twice a second. Both views compare front/back row buffers and publish
 only changed rows in synchronized terminal updates. Panes up to 512 columns ×
 180 rows are supported.
