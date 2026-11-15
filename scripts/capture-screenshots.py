@@ -52,7 +52,9 @@ def raster(raw, destination):
                 continue
             for char in chunk:
                 draw.rectangle((margin+x*cell_w, margin+y*cell_h, margin+(x+1)*cell_w-1, margin+(y+1)*cell_h-1), fill=background)
-                if char == '█':
+                if char == '▀':
+                    draw.rectangle((margin+x*cell_w, margin+y*cell_h, margin+(x+1)*cell_w-1, margin+y*cell_h+cell_h//2-1), fill=colour)
+                elif char == '█':
                     draw.rectangle((margin+x*cell_w, margin+y*cell_h, margin+(x+1)*cell_w-1, margin+(y+1)*cell_h-1), fill=colour)
                 elif char != ' ':
                     draw.text((margin+x*cell_w, margin+y*cell_h), char, font=font, fill=colour)
@@ -62,19 +64,30 @@ def raster(raw, destination):
 
 try:
     tmux('new-session', '-d', '-s', 'capture', '-x', '200', '-y', '65', f'{binary} --activity --demo')
+    # A control-mode client makes the pane count as on screen, so views keep
+    # drawing; a fixed window size stops the client resizing the capture.
+    tmux('set', '-g', 'window-size', 'manual')
+    client = subprocess.Popen(['tmux', '-L', socket, '-C', 'attach', '-t', 'capture'],
+                              stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    tmux('resize-window', '-t', 'capture:0', '-x', '200', '-y', '65')
     time.sleep(1.0)
     tmux('send-keys', '-t', 'capture:0', 'Space')
     time.sleep(0.4)
-    for name, key in [('activity-3d', None), ('activity-flat', 'f')]:
+    for name, key in [('activity-3d', None), ('activity-flat', 'Enter')]:
         if key:
             tmux('send-keys', '-t', 'capture:0', key)
             time.sleep(0.3)
-        raw = tmux('capture-pane', '-p', '-e', '-t', 'capture:0')
+        raw = tmux('capture-pane', '-p', '-e', '-N', '-t', 'capture:0')
         raster(raw, root / 'docs' / f'{name}.png')
     tmux('respawn-pane', '-k', '-t', 'capture:0', f'{binary} --demo')
     time.sleep(0.8)
     tmux('send-keys', '-t', 'capture:0', 'Space')
     time.sleep(0.3)
-    raster(tmux('capture-pane', '-p', '-e', '-t', 'capture:0'), root / 'docs' / 'telemetry.png')
+    raster(tmux('capture-pane', '-p', '-e', '-N', '-t', 'capture:0'), root / 'docs' / 'telemetry.png')
+    # Narrow panes, and `f`, give one sparkline per channel.
+    tmux('send-keys', '-t', 'capture:0', 'f')
+    time.sleep(0.3)
+    raster(tmux('capture-pane', '-p', '-e', '-N', '-t', 'capture:0'), root / 'docs' / 'telemetry-flat.png')
 finally:
     subprocess.run(['tmux', '-L', socket, 'kill-server'], check=False, capture_output=True)

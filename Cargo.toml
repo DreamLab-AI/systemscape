@@ -1,6 +1,6 @@
 [package]
 name = "systemscape"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Interactive 3D system telemetry and agent work history in the terminal"
 license = "Apache-2.0"
