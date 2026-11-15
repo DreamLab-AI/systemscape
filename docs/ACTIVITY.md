@@ -36,8 +36,12 @@ contract. Long lines and cold histories exceeding the tail limit are skipped and
 reported as limited. Discovery is bounded to 32,768 entries, 256 profiles and 256
 selected files, with bounded traversal depth and no recursion through child symlinks.
 
+Tool records keep the tool's main argument: a file path, the first line of a
+command, a search pattern or a query, cut to 240 characters. Codex `exec` scripts
+are reduced to the tool called inside them and its first string argument.
+
 The renderer strips terminal controls and directional formatting from excerpts.
-It does not redact credentials typed into prompts: this is a local operator view,
+It does not redact credentials typed into prompts or commands: this is a local operator view,
 and screenshots or JSON exports can contain sensitive source text. Use `--demo`
 when sharing the display.
 
@@ -53,7 +57,8 @@ python3 scripts/terminal-smoke.py
 
 Regression tests cover partial appends, replay, rotations and rewrites, numeric
 archive identities, pending-file disclosure, invalid shapes, control filtering,
-subagent discovery, metadata preservation across a bounded tail, scene limits and
-small terminals. The terminal smoke test exercises the continuous tour, manual
-pause/resume, source details, flat mode, resize and exit in an isolated tmux server.
+subagent discovery, metadata preservation across a bounded tail, tool-argument
+extraction, session grouping, tower compression, layout limits and small
+terminals. The terminal smoke test exercises the city, session selection, the
+detail view, source details, focus pausing, resize and exit in an isolated tmux server.
 [Screenshot capture](SCREENSHOTS.md) exercises both live terminal modes.

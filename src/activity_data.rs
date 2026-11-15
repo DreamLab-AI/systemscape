@@ -119,6 +119,84 @@ fn identity(m: &fs::Metadata) -> (u64, u64) {
         0,
     )
 }
+/// The most telling argument of a tool call: the file, command or query it
+/// was given. Only the first 240 cleaned characters are ever kept.
+fn tool_detail(input: &Value) -> String {
+    for key in [
+        "file_path",
+        "command",
+        "cmd",
+        "pattern",
+        "query",
+        "url",
+        "path",
+        "skill",
+        "description",
+        "prompt",
+    ] {
+        match &input[key] {
+            // A multi-line script is known by its first line.
+            Value::String(s) if !s.trim().is_empty() => {
+                return s.trim().lines().next().unwrap_or_default().to_owned()
+            }
+            Value::Array(parts) if !parts.is_empty() => {
+                return parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+/// First quoted string in a snippet of code, without its quotes.
+fn first_literal(code: &str) -> String {
+    let Some(start) = code.find(['"', '\'', '`']) else {
+        return String::new();
+    };
+    let quote = code[start..].chars().next().unwrap_or('"');
+    let mut out = String::new();
+    let mut chars = code[start + 1..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c if c == quote => break,
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Name and main argument of a Codex tool call. Codex wraps most calls in an
+/// `exec` script such as `tools.exec_command({cmd:"cargo test"})`; report the
+/// tool called inside it and what it was given, rather than just "exec".
+fn codex_call(payload: &Value) -> String {
+    let name = fallback(string(&payload["name"]), "tool");
+    if let Some(code) = payload["input"].as_str() {
+        if name == "apply_patch" {
+            let file = code
+                .split_once("File: ")
+                .map_or("", |(_, rest)| rest.lines().next().unwrap_or(""));
+            return format!("apply_patch {file}");
+        }
+        let inner = code.split_once("tools.").and_then(|(_, rest)| {
+            let end = rest.find('(')?;
+            let tool = &rest[..end];
+            let valid = !tool.is_empty() && tool.chars().all(|c| c.is_alphanumeric() || c == '_');
+            valid.then(|| format!("{tool} {}", first_literal(&rest[end..])))
+        });
+        return inner.unwrap_or_else(|| format!("{name} {code}"));
+    }
+    let arguments = payload["arguments"]
+        .as_str()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or(Value::Null);
+    format!("{name} {}", tool_detail(&arguments))
+}
+
 fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
     if !row.is_object() {
         return vec![];
@@ -224,10 +302,7 @@ fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
                         format!(
                             "{} {}",
                             fallback(string(&b["name"]), "tool"),
-                            fallback(
-                                string(&b["input"]["file_path"]),
-                                string(&b["input"]["description"])
-                            )
+                            tool_detail(&b["input"])
                         ),
                     ));
                 } else if b["type"] == "tool_result" && b["is_error"] == true {
@@ -268,7 +343,7 @@ fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
             ("response_item", "function_call" | "custom_tool_call") => found.push((
                 fallback(string(&payload["call_id"]), &id).to_owned(),
                 "tool",
-                fallback(string(&payload["name"]), "tool").to_owned(),
+                codex_call(payload),
             )),
             _ => {}
         },
@@ -598,28 +673,141 @@ impl Collector {
 }
 
 /// Synthetic fixtures for a display demo; never mixed with observed records.
+/// Seven sessions across four projects: three recording now, one that ended on
+/// an error, and three idle, each a run of prompts followed by tool calls.
 pub fn demo_events() -> Vec<Event> {
+    // (agent, session, project, minutes since its last record, turns, ending)
+    let sessions = [
+        (
+            "codex",
+            "01a1dc07-demo",
+            "/workspace/VisionFlow",
+            0,
+            7,
+            "tool",
+        ),
+        (
+            "claude",
+            "93bc1f6c-demo",
+            "/workspace/systemscape",
+            0,
+            4,
+            "tool",
+        ),
+        (
+            "claude",
+            "a3f09e11-demo",
+            "/workspace/agentbox",
+            1,
+            6,
+            "receipt",
+        ),
+        (
+            "codex",
+            "77e385bc-demo",
+            "/workspace/VisionFlow",
+            4,
+            3,
+            "failure",
+        ),
+        (
+            "claude",
+            "9c2d4410-demo",
+            "/workspace/agentbox",
+            14,
+            5,
+            "receipt",
+        ),
+        (
+            "archive:tester",
+            "handoff-17",
+            "/workspace/agentbox",
+            42,
+            2,
+            "event",
+        ),
+        (
+            "claude",
+            "5be0c7aa-demo",
+            "/workspace/dreamlab-cumbria",
+            95,
+            3,
+            "receipt",
+        ),
+    ];
+    let prompts = [
+        "Inspect agent activity history",
+        "Why is the nightly build red?",
+        "Add a flat detail view",
+        "Split the GPU channels per card",
+        "Tidy the docs and commit",
+        "Find where sessions are grouped",
+        "Run the smoke test again",
+    ];
+    let tools = [
+        "Read src/activity.rs",
+        "Grep fn render",
+        "Bash cargo test --locked",
+        "Edit src/activity.rs",
+        "exec_command cargo clippy --all-targets",
+        "Read README.md",
+        "mcp__claude-flow__memory_search current focus",
+        "Edit src/pixels.rs",
+        "Bash git status --short",
+        "WebSearch half-block terminal rendering",
+        "Agent review the diff",
+        "apply_patch src/telemetry.rs",
+        "Write docs/ACTIVITY.md",
+        "Bash python3 scripts/terminal-smoke.py",
+    ];
     let now = Utc::now();
-    (0..24)
-        .map(|i| Event {
-            key: format!("demo:{i}"),
-            at: (now - chrono::Duration::minutes(i * 7))
-                .to_rfc3339_opts(SecondsFormat::Millis, true),
-            agent: ["claude:builder", "codex:reviewer", "archive:tester"][(i % 3) as usize].into(),
-            session: format!("demo-session-{}", i % 4),
-            project: ["/workspace/agentbox", "/workspace/systemscape"][(i % 2) as usize].into(),
-            kind: ["prompt", "tool", "event", "failure", "receipt"][(i % 5) as usize].into(),
-            text: [
-                "Inspect agent activity history",
-                "Read renderer source",
-                "Recorded task started",
-                "Tool reported an error",
-                "Recorded commit (demo)",
-            ][(i % 5) as usize]
-                .into(),
-            source: "synthetic demo".into(),
-        })
-        .collect()
+    let mut events = Vec::new();
+    for (s, (agent, session, project, idle_minutes, turns, ending)) in sessions.iter().enumerate() {
+        // Build the session newest first, stepping back a few seconds per record.
+        let mut back =
+            chrono::Duration::minutes(*idle_minutes) + chrono::Duration::seconds(3 + 9 * s as i64);
+        let mut push = |kind: &str, text: String, back: &mut chrono::Duration| {
+            events.push(Event {
+                key: format!("demo:{s}:{}", back.num_seconds()),
+                at: (now - *back).to_rfc3339_opts(SecondsFormat::Millis, true),
+                agent: (*agent).into(),
+                session: (*session).into(),
+                project: (*project).into(),
+                kind: kind.into(),
+                text,
+                source: "synthetic demo".into(),
+            });
+            *back += chrono::Duration::seconds(17 + (events.len() as i64 * 7) % 40);
+        };
+        match *ending {
+            "failure" => push("failure", "Recorded turn aborted".into(), &mut back),
+            "receipt" => push(
+                "receipt",
+                format!("Recorded commit {s}c0ffee (demo)"),
+                &mut back,
+            ),
+            "event" => push("event", "Recorded task complete".into(), &mut back),
+            _ => {}
+        }
+        for turn in 0..*turns {
+            for call in 0..(3 + (turn * 5 + s * 3) % 9) {
+                push(
+                    "tool",
+                    tools[(s * 5 + turn * 3 + call * 7) % tools.len()].into(),
+                    &mut back,
+                );
+                if (s + turn + call) % 23 == 11 {
+                    push("failure", "Tool reported an error".into(), &mut back);
+                }
+            }
+            push(
+                "prompt",
+                prompts[(s + turn * 2) % prompts.len()].into(),
+                &mut back,
+            );
+        }
+    }
+    events
 }
 
 #[cfg(test)]
@@ -818,5 +1006,62 @@ mod tests {
         c.poll();
         assert_eq!(c.rows().len(), 1);
         assert_eq!(c.rows()[0].kind, "failure");
+    }
+    #[test]
+    fn tool_calls_keep_the_command_or_file_they_were_given() {
+        let detail = |v: Value| tool_detail(&v);
+        assert_eq!(
+            detail(serde_json::json!({"file_path":"/a/b.rs","description":"x"})),
+            "/a/b.rs"
+        );
+        assert_eq!(
+            detail(serde_json::json!({"command":"cargo test","description":"Run tests"})),
+            "cargo test"
+        );
+        assert_eq!(
+            detail(serde_json::json!({"command":["bash","-lc","ls"]})),
+            "bash -lc ls"
+        );
+        assert_eq!(detail(serde_json::json!({"pattern":"fn main"})), "fn main");
+        assert_eq!(
+            detail(serde_json::json!({"command":"python3 - <<'E'\nimport os\nE"})),
+            "python3 - <<'E'"
+        );
+        assert_eq!(detail(serde_json::json!({"other":1})), "");
+
+        let call = |v: Value| codex_call(&v);
+        assert_eq!(
+            call(
+                serde_json::json!({"name":"exec","input":"text(await tools.exec_command({cmd:\"pwd; rg \\\"x\\\" -g '*.rs'\"}));"})
+            ),
+            "exec_command pwd; rg \"x\" -g '*.rs'"
+        );
+        assert_eq!(
+            call(
+                serde_json::json!({"name":"exec","input":"text(await tools.mcp__m__memory_search({query:'current focus',limit:3}))"})
+            ),
+            "mcp__m__memory_search current focus"
+        );
+        assert_eq!(
+            call(
+                serde_json::json!({"name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n"})
+            ),
+            "apply_patch src/lib.rs"
+        );
+        assert_eq!(
+            call(serde_json::json!({"name":"exec","input":"1 + 1"})),
+            "exec 1 + 1"
+        );
+        assert_eq!(
+            call(
+                serde_json::json!({"name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls\"]}"})
+            ),
+            "shell bash -lc ls"
+        );
+        assert_eq!(
+            call(serde_json::json!({"name":"update_plan","arguments":"not json"})),
+            "update_plan "
+        );
+        assert_eq!(call(serde_json::json!({})), "tool ");
     }
 }
