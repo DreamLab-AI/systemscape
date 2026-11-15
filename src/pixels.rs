@@ -80,7 +80,12 @@ impl PixelCanvas {
 
     /// Size of the surface the 3D scene is drawn to, in samples.
     pub fn sample_dims(&self) -> (usize, usize) {
-        (self.width * SAMPLES, self.rows * 2 * SAMPLES)
+        Self::samples_for(self.width, self.rows)
+    }
+
+    /// Sample-surface size of a canvas of `width` × `rows` cells.
+    pub fn samples_for(width: usize, rows: usize) -> (usize, usize) {
+        (width * SAMPLES, rows * 2 * SAMPLES)
     }
 
     /// The text cell (column, row) containing a sample position.
@@ -146,13 +151,15 @@ impl PixelCanvas {
 
     /// Set one cell, blanking the other half of any wide character it splits.
     fn put(&mut self, base: usize, x: usize, c: char, colour: Rgb) {
-        if matches!(self.text[base + x], Some((CONTINUATION, _))) && x > 0 {
-            self.text[base + x - 1] = Some((' ', colour));
-        }
-        if x + 1 < self.width
-            && matches!(self.text[base + x + 1], Some((CONTINUATION, _)))
-            && c != CONTINUATION
-        {
+        let continuation = |cell: Option<(char, Rgb)>| matches!(cell, Some((CONTINUATION, _)));
+        let old = self.text[base + x];
+        if continuation(old) {
+            // Over the right half of a wide character: blank its left half.
+            if x > 0 {
+                self.text[base + x - 1] = Some((' ', colour));
+            }
+        } else if x + 1 < self.width && continuation(self.text[base + x + 1]) {
+            // Over the left half of a wide character: drop its right half.
             self.text[base + x + 1] = None;
         }
         self.text[base + x] = Some((c, colour));
@@ -256,5 +263,12 @@ mod tests {
         assert!(row.contains(" z本"), "{row:?}");
         canvas.label(5, 0, "語", (9, 9, 9)); // no room for both halves
         assert!(!canvas.rows()[0].contains('語'));
+        // A wide glyph straddling two others blanks the half of each it splits.
+        let mut canvas = PixelCanvas::new(6, 1, (0, 0, 0), (0, 0, 0));
+        canvas.label(0, 0, "日本", (9, 9, 9));
+        canvas.label(1, 0, "語", (9, 9, 9));
+        let row = &canvas.rows()[0];
+        assert!(row.contains(" 語 "), "{row:?}");
+        assert_eq!(visible(row) + 1, 6, "one wide glyph and four narrow cells");
     }
 }

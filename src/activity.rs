@@ -909,6 +909,55 @@ fn fit_distance(
     widest
 }
 
+/// The layout, tallest tower and camera distance for a city drawn into
+/// `frame`. A wide pane fits a small city by its height, so the city is
+/// stretched sideways as far as that costs no extra distance.
+fn city_view(
+    city: &City<'_>,
+    yaw: f64,
+    lift: f64,
+    centre: Vec2D,
+    frame: (f64, f64, f64, f64),
+) -> (Layout, f64, f64) {
+    let tallest_of = |lay: &Layout| {
+        let scale = tower_scale(city, lay);
+        lay.towers
+            .iter()
+            .map(|t| raw_height(&city.sessions[t.session]) * scale)
+            .fold(1.0, f64::max)
+    };
+    let distance = |lay: &Layout| fit_distance(lay, tallest_of(lay), yaw, lift, centre, frame);
+    let plain = layout(city, 1.0);
+    let closest = distance(&plain);
+    let lay = [2.6, 2.2, 1.9, 1.6, 1.35, 1.15]
+        .into_iter()
+        .map(|stretch| layout(city, stretch))
+        .find(|lay| distance(lay) <= closest * 1.03)
+        .unwrap_or(plain);
+    let tallest = tallest_of(&lay);
+    let fitted = distance(&lay);
+    (lay, tallest, fitted)
+}
+
+/// Scene area of a pane in samples: the centre the camera aims at, and the
+/// frame (x0, y0, x1, y1) the city must stay inside, with a small margin.
+fn scene_frame(
+    dims: (usize, usize),
+    scene_top: i64,
+    scene_bottom: i64,
+) -> (Vec2D, (f64, f64, f64, f64)) {
+    let (width, height) = PixelCanvas::samples_for(dims.0, dims.1);
+    let cell = height as i64 / (dims.1 as i64).max(1);
+    let centre = Vec2D::new(width as i64 / 2, (scene_top + scene_bottom) * cell / 2);
+    let frame = (
+        4.0,
+        (scene_top * cell) as f64 + 2.0,
+        width as f64 - 4.0,
+        (scene_bottom * cell) as f64 - 2.0,
+    );
+    (centre, frame)
+}
+
 /// The glance view: the city, a callout on the selected tower and a strip of
 /// the most recently active sessions.
 fn render_city(
@@ -930,35 +979,9 @@ fn render_city(
     let scene_top = 2;
     let scene_bottom = rows - 1 - strip; // first row below the scene
     let (width, height) = canvas.sample_dims();
-    let cell = height as i64 / rows.max(1);
-    let centre = Vec2D::new(width as i64 / 2, (scene_top + scene_bottom) * cell / 2);
-    // Keep a margin of a column either side and half a row above and below.
-    let frame = (
-        2.0 * 2.0,
-        (scene_top * cell) as f64 + 2.0,
-        width as f64 - 4.0,
-        (scene_bottom * cell) as f64 - 2.0,
-    );
-    let tallest_of = |lay: &Layout| {
-        let scale = tower_scale(city, lay);
-        lay.towers
-            .iter()
-            .map(|t| raw_height(&city.sessions[t.session]) * scale)
-            .fold(1.0, f64::max)
-    };
-    let distance =
-        |lay: &Layout| fit_distance(lay, tallest_of(lay), state.yaw, state.lift, centre, frame);
-    // A wide pane fits a small city by its height. Stretch the city sideways as
-    // far as that costs no extra distance, so it fills the width too.
-    let plain = layout(city, 1.0);
-    let closest = distance(&plain);
-    let lay = [2.6, 2.2, 1.9, 1.6, 1.35, 1.15]
-        .into_iter()
-        .map(|stretch| layout(city, stretch))
-        .find(|lay| distance(lay) <= closest * 1.03)
-        .unwrap_or(plain);
+    let (centre, frame) = scene_frame(dims, scene_top, scene_bottom);
+    let (lay, tallest, fitted) = city_view(city, state.yaw, state.lift, centre, frame);
     let scale = tower_scale(city, &lay);
-    let tallest = tallest_of(&lay);
     let selected_top = lay
         .towers
         .iter()
@@ -966,7 +989,7 @@ fn render_city(
         .map(|t| Vec3D::new(t.x, raw_height(&city.sessions[t.session]) * scale, t.z));
 
     // The camera sways in front of the city, always aimed at its centre.
-    let radius = distance(&lay) * state.dolly;
+    let radius = fitted * state.dolly;
     let angle = state.yaw + SWAY * (state.t * 0.11).sin();
     let viewport = city_camera(tallest, angle, radius, state.lift, centre);
     let (ground, towers) = build_scene(city, &lay, state.selected, state.t, now);
@@ -1904,46 +1927,19 @@ mod tests {
                         select(&mut state, &built, selected.min(built.sessions.len() - 1));
                         let rows = render(&events, "fixture", &mut state, dims, false, 0.0);
                         assert_eq!(rows.len(), dims.1);
-                        // Re-derive the camera exactly as render_city does.
+                        // The same camera render_city uses.
                         let strip = (built.sessions.len().min(5) as i64 + 1).min(dims.1 as i64 / 3);
                         let bottom = dims.1 as i64 - 1 - strip;
-                        let canvas = PixelCanvas::new(dims.0, dims.1, PANEL, PANEL);
-                        let (width, height) = canvas.sample_dims();
-                        let cell = height as i64 / dims.1 as i64;
-                        let centre = Vec2D::new(width as i64 / 2, (2 + bottom) * cell / 2);
-                        let frame = (
-                            4.0,
-                            (2 * cell) as f64 + 2.0,
-                            width as f64 - 4.0,
-                            (bottom * cell) as f64 - 2.0,
-                        );
-                        let tallest_of = |lay: &Layout| {
-                            let scale = tower_scale(&built, lay);
-                            lay.towers
-                                .iter()
-                                .map(|t| raw_height(&built.sessions[t.session]) * scale)
-                                .fold(1.0, f64::max)
-                        };
-                        let fit = |lay: &Layout| {
-                            fit_distance(lay, tallest_of(lay), 0.0, 0.0, centre, frame)
-                        };
-                        let plain_layout = layout(&built, 1.0);
-                        let closest = fit(&plain_layout);
-                        let lay = [2.6, 2.2, 1.9, 1.6, 1.35, 1.15]
-                            .into_iter()
-                            .map(|s| layout(&built, s))
-                            .find(|lay| fit(lay) <= closest * 1.03)
-                            .unwrap_or(plain_layout);
-                        let tallest = tallest_of(&lay);
+                        let (centre, frame) = scene_frame(dims, 2, bottom);
+                        let (lay, tallest, fitted) = city_view(&built, 0.0, 0.0, centre, frame);
+                        let (width, height) = PixelCanvas::samples_for(dims.0, dims.1);
+                        let (width, cell) = (width as i64, height as i64 / dims.1 as i64);
                         let angle = SWAY * (t * 0.11).sin();
-                        let viewport = city_camera(tallest, angle, fit(&lay), 0.0, centre);
+                        let viewport = city_camera(tallest, angle, fitted, 0.0, centre);
                         for corner in city_corners(&lay, tallest) {
                             let p = project(&viewport, Transform3D::IDENTITY, corner);
                             assert!(
-                                p.x >= 0
-                                    && p.x <= width as i64
-                                    && p.y >= 2 * cell
-                                    && p.y <= bottom * cell,
+                                p.x >= 0 && p.x <= width && p.y >= 2 * cell && p.y <= bottom * cell,
                                 "{dims:?} t {t} corner {corner:?} at {p:?} outside {width}x{}",
                                 bottom * cell
                             );
