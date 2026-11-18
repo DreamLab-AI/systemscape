@@ -19,6 +19,7 @@ use super::{
     MAX_TOWERS, MUTED,
 };
 use crate::activity_data::{clean, Event};
+use crate::insight::whole_path;
 use crate::pixels::{mix, PixelCanvas, Rgb};
 use crate::{ColChar, Colour, Face, Mesh3D, Modifier, Vec3D};
 use crossterm::event::KeyCode;
@@ -107,8 +108,10 @@ pub(super) struct Road<'a> {
     /// Session indices, `a < b`.
     pub a: usize,
     pub b: usize,
-    /// The shared paths, as recorded.
-    pub files: Vec<&'a str>,
+    /// One edit record per shared file, in path order. Paths are compared
+    /// whole, as the summary compares them ([`whole_path`]), so the city and
+    /// the summary agree on what is contended.
+    pub files: Vec<&'a Event>,
     /// Both sessions have a record within `LIVE_SECS` of `now`.
     pub live: bool,
 }
@@ -180,22 +183,28 @@ fn bridges(city: &City<'_>) -> Vec<(usize, usize)> {
 /// towers' own records.
 fn roads<'a>(city: &City<'a>, now: f64) -> Vec<Road<'a>> {
     let drawn = city.sessions.len().min(MAX_TOWERS);
-    let mut editors: BTreeMap<&'a str, BTreeSet<usize>> = BTreeMap::new();
+    // Codex records paths relative to the project and Claude records them
+    // whole; both are made whole before comparing, as the summary does.
+    let mut editors: BTreeMap<String, (&'a Event, BTreeSet<usize>)> = BTreeMap::new();
     for (i, session) in city.sessions[..drawn].iter().enumerate() {
         for record in &session.records {
-            if let Some(path) = record.path.as_deref() {
-                if Mark::of(record) == Mark::Edit {
-                    editors.entry(path).or_default().insert(i);
+            if Mark::of(record) == Mark::Edit {
+                if let Some(path) = whole_path(record) {
+                    editors
+                        .entry(path)
+                        .or_insert((record, BTreeSet::new()))
+                        .1
+                        .insert(i);
                 }
             }
         }
     }
-    let mut pairs: BTreeMap<(usize, usize), Vec<&'a str>> = BTreeMap::new();
-    for (path, sessions) in &editors {
+    let mut pairs: BTreeMap<(usize, usize), Vec<&'a Event>> = BTreeMap::new();
+    for (record, sessions) in editors.values() {
         let sessions: Vec<usize> = sessions.iter().copied().collect();
         for (n, &a) in sessions.iter().enumerate() {
             for &b in &sessions[n + 1..] {
-                pairs.entry((a, b)).or_default().push(path);
+                pairs.entry((a, b)).or_default().push(record);
             }
         }
     }
@@ -647,7 +656,10 @@ pub(super) fn note(
         let files: usize = mine.iter().map(|r| r.files.len()).sum();
         let mut text = format!(
             "shares {} with {} {}{}",
-            display_path(first.files[0], session.project),
+            display_path(
+                &whole_path(first.files[0]).unwrap_or_default(),
+                session.project
+            ),
             other.agent,
             short(other.id),
             if first.live { " (both active)" } else { "" }
@@ -756,8 +768,11 @@ mod tests {
         assert_eq!(found.len(), 1);
         let road = &found[0];
         assert_eq!(
-            (BTreeSet::from([id(road.a), id(road.b)]), road.files.clone()),
-            (BTreeSet::from(["a", "b"]), vec!["/work/alpha/x.rs"])
+            (BTreeSet::from([id(road.a), id(road.b)]), paths(road)),
+            (
+                BTreeSet::from(["a", "b"]),
+                vec!["/work/alpha/x.rs".to_string()]
+            )
         );
         // At 10:30 "b" is active but "a" last worked half an hour ago.
         assert!(!road.live);
@@ -767,6 +782,76 @@ mod tests {
         busy.push(record(5, &at(2, 26), "a", "Read z", None));
         let built = city(&busy, &mut State::default());
         assert!(roads(&built, early)[0].live);
+    }
+
+    fn paths(road: &Road<'_>) -> Vec<String> {
+        road.files.iter().filter_map(|e| whole_path(e)).collect()
+    }
+
+    #[test]
+    fn a_codex_relative_path_and_a_claude_whole_path_to_one_file_share_a_road() {
+        let mut events = [
+            record(
+                0,
+                &at(2, 0),
+                "claude-s",
+                "Edit src/x.rs",
+                Some("/work/alpha/src/x.rs"),
+            ),
+            record(
+                1,
+                &at(2, 1),
+                "codex-s",
+                "apply_patch src/x.rs",
+                Some("./src/x.rs"),
+            ),
+            // Same relative name in another project is another file.
+            record(
+                2,
+                &at(2, 2),
+                "other",
+                "apply_patch src/x.rs",
+                Some("src/x.rs"),
+            ),
+        ];
+        events[1].agent = "codex".into();
+        events[2].agent = "codex".into();
+        events[2].project = "/work/beta".into();
+        let built = city(&events, &mut State::default());
+        let found = roads(&built, noon(2));
+        assert_eq!(found.len(), 1, "{found:?}");
+        let ids = BTreeSet::from([built.sessions[found[0].a].id, built.sessions[found[0].b].id]);
+        assert_eq!(ids, BTreeSet::from(["claude-s", "codex-s"]));
+        assert_eq!(paths(&found[0]), vec!["/work/alpha/src/x.rs".to_string()]);
+    }
+
+    #[test]
+    fn roads_and_the_summary_agree_on_contended_files_in_the_demo() {
+        let events = demo_events();
+        let built = city(&events, &mut State::default());
+        assert!(
+            built.sessions.len() <= MAX_TOWERS,
+            "every demo session is drawn"
+        );
+        let mut from_roads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for road in roads(&built, unix_now()) {
+            for path in paths(&road) {
+                for i in [road.a, road.b] {
+                    let s = &built.sessions[i];
+                    from_roads
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(format!("{} {}", s.agent, s.id));
+                }
+            }
+        }
+        let from_summary: BTreeMap<String, BTreeSet<String>> =
+            crate::insight::contended(&events, &built.day)
+                .into_iter()
+                .map(|c| (c.path, c.sessions.into_iter().collect()))
+                .collect();
+        assert!(!from_summary.is_empty(), "the demo has a contended file");
+        assert_eq!(from_roads, from_summary);
     }
 
     #[test]

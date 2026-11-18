@@ -31,8 +31,12 @@ leans back. Turning the camera (Left or Right) shows the whole span.
 
 Two drawn sessions that both edited or wrote the same file on the day shown are
 joined by a road on the ground. A record counts when the city colours it as an
-edit (the `edit`, `write` and `patch` tools) and it carries the file's whole
-path (`Event.path`). Reads and searches do not count.
+edit (the `edit`, `write` and `patch` tools) and it carries a file path
+(`Event.path`). Reads and searches do not count. Paths are made whole before
+they are compared, by the same rule `--summary`, the MCP server and the metrics
+endpoint use: Codex records paths relative to the project, so `src/x.rs` in
+`/work/alpha` matches Claude's `/work/alpha/src/x.rs`. The city's roads and the
+summary's contended files therefore name the same files (tested on the demo).
 
 - A road is **red** while both sessions are active, meaning each has a record
   within the last five minutes (`LIVE_SECS`). Otherwise it is a muted grey-rose.
@@ -95,8 +99,8 @@ The three keys are view toggles like `h`: they redraw but leave the tour flying.
 
 - A road means two sessions' records both name the file as edited that day. It
   does not show that their edits conflicted, overlapped in time or touched the
-  same lines. Paths are compared as recorded, so the same file reached by
-  two different paths (a symlink, or a relative path versus an absolute one)
+  same lines. Relative paths are resolved against the project, but nothing
+  else is normalised, so the same file reached through a symlink or a `..`
   is not matched.
 - An arc means a subagent's transcript names that parent session. Codex and
   archive sessions record no parent and get no arcs.
