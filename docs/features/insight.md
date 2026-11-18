@@ -28,7 +28,8 @@ deterministic. A normal day fits on one screen: at most 6 projects, 5
 sessions per project, 5 call-outs of each kind and 4 commits per session are
 shown, and each cut list says how many it left out. `--day` defaults to the
 newest day with records. `--json` prints `{"coverage", "digest"}` (and
-`"commits"` with `--verify-commits`) with nothing cut.
+`"commits"` with `--verify-commits`) with nothing cut, every string scrubbed
+of controls, directional formatting and invisible characters.
 
 Like `--text` and `--json`, the summary is one bounded collector poll (at most
 8 MiB, newest files first), so on a large history the coverage line can
@@ -71,10 +72,11 @@ paired with calls the way the collector keys them:
 - A Claude tool result that reports an error is recorded under its call's key
   plus `:error`, so it pairs with exactly that call, even among parallel calls.
 - Any other failure carries no call key and pairs with the tool call it
-  immediately follows. That covers an archive step that failed, a Codex
-  aborted turn and the demo.
+  immediately follows. In practice that is a Codex aborted turn, or the demo.
 - Codex tool output is not recorded, so a Codex session is only seen failing
   through an aborted turn.
+- Archive records are steps and failures, never tool calls, so an archive
+  session is never marked stuck.
 
 The city marks a stuck session with a red `↻` in the most-recent strip and in
 the flat session list, ahead of `!`. Unlike the status line, the city shows

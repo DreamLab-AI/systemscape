@@ -6,11 +6,43 @@ use crate::activity_data::{clean, demo_events, Collector, Event};
 use crate::insight::{self, Digest};
 use crate::telemetry::{poll_sensors, Gpu, RateState, Snapshot};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Longest string an output keeps (paths are kept whole up to this).
+pub(crate) const STRING_LIMIT: usize = 1024;
+
+/// Remove what `activity_data::clean` removes (controls, directional
+/// formatting, invisible carriers) without folding whitespace, and cap the length.
+pub(crate) fn scrub(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c,
+        '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' |
+        '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+        })
+        .take(STRING_LIMIT)
+        .collect()
+}
+
+/// Scrub every string in a result, keys included.
+pub(crate) fn scrub_value(value: Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(scrub(&s)),
+        Value::Array(items) => Value::Array(items.into_iter().map(scrub_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (scrub(&k), scrub_value(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
 
 /// Coverage line for synthetic records, as the activity view prints it.
 const DEMO_COVERAGE: &str = "Synthetic fixture · no agent files opened";
@@ -174,7 +206,7 @@ impl Reading {
     /// stable wire contract, rather than reaching into telemetry's fields.
     fn of(snapshot: &Snapshot) -> Self {
         let finite = |v: Option<f64>| v.filter(|v| v.is_finite());
-        let field = |card: &serde_json::Value, key: &str| finite(card[key].as_f64());
+        let field = |card: &Value, key: &str| finite(card[key].as_f64());
         let cards = serde_json::to_value(&snapshot.gpus).unwrap_or_default();
         Self {
             cpu_temp_c: snapshot
@@ -539,7 +571,8 @@ pub fn summary(args: &[String]) -> io::Result<()> {
             commits.sort_by_key(|c| (c["project"].to_string(), c["sha"].to_string()));
             value["commits"] = commits.into();
         }
-        println!("{value}");
+        // Record paths are only stripped of controls by the collector.
+        println!("{}", scrub_value(value));
     } else {
         for line in summary_text(&digest, &coverage, receipts.as_ref()) {
             println!("{line}");
@@ -775,6 +808,7 @@ mod tests {
                 .arg("-C")
                 .arg(&dir)
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
                 .args(args)
                 .stderr(Stdio::null())
                 .output()
@@ -855,5 +889,19 @@ mod tests {
         assert_eq!(left, ["--tmux"]);
         assert!(flags.demo && failed, "--archive without a path is refused");
         assert_eq!(flags.home.as_deref(), Some(Path::new("/h")));
+    }
+
+    #[test]
+    fn json_output_scrubs_directional_and_invisible_characters_from_paths() {
+        // The collector strips controls from paths but keeps other text whole.
+        let edit = |session: &str| Event {
+            path: Some("/work/app/evil\u{202e}sr.rs\u{200b}".into()),
+            ..record(session, 10, "tool", "Edit evil")
+        };
+        let digest = insight::digest(&[edit("a"), edit("b")], "2026-11-18");
+        assert!(digest.contended[0].path.contains('\u{202e}'));
+        let printed = scrub_value(serde_json::json!({"digest": digest})).to_string();
+        assert!(printed.contains("/work/app/evilsr.rs"));
+        assert!(!printed.contains('\u{202e}') && !printed.contains('\u{200b}'));
     }
 }

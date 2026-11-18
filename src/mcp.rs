@@ -10,7 +10,8 @@
 //! nothing a record contains is ever run.
 use crate::insight;
 use crate::report::{
-    fit, invalid, verify_digest, Receipt, Sensors, SourceFlags, Sources, Verifier,
+    fit, invalid, scrub, scrub_value, verify_digest, Receipt, Sensors, SourceFlags, Sources,
+    Verifier, STRING_LIMIT,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -26,8 +27,6 @@ const LINE_LIMIT: usize = 1024 * 1024;
 const RESULT_LIMIT: usize = 256 * 1024;
 /// Longest list any tool returns.
 const LIST_LIMIT: usize = 50;
-/// Longest string any tool returns (paths are kept whole up to this).
-const STRING_LIMIT: usize = 1024;
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -110,34 +109,6 @@ fn tools() -> Vec<Value> {
             &[],
         ),
     ]
-}
-
-/// Remove what `activity_data::clean` removes (controls, directional
-/// formatting, invisible carriers) without folding whitespace, and cap the length.
-fn scrub(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(*c,
-        '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' |
-        '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
-        })
-        .take(STRING_LIMIT)
-        .collect()
-}
-
-/// Scrub every string in a result, keys included.
-fn scrub_value(value: Value) -> Value {
-    match value {
-        Value::String(s) => Value::String(scrub(&s)),
-        Value::Array(items) => Value::Array(items.into_iter().map(scrub_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(k, v)| (scrub(&k), scrub_value(v)))
-                .collect(),
-        ),
-        other => other,
-    }
 }
 
 fn server_info() -> Value {
@@ -353,6 +324,8 @@ impl Server {
             }
         };
         let mut result = result;
+        // 2026-07-28 requires `resultType`; earlier clients ignore it.
+        result["resultType"] = json!("complete");
         result["_meta"] = json!({"io.modelcontextprotocol/serverInfo": server_info()});
         Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }

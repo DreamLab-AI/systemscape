@@ -76,13 +76,14 @@ pub(crate) struct Run {
 /// - A Claude tool result that reports an error is recorded under the key of
 ///   the call it answers plus `:error`, so it pairs with exactly that call even
 ///   when several calls ran in parallel.
-/// - Any other failure (an archive step that failed, a Codex aborted turn, the
-///   demo fixture) carries no call key, so it pairs with the tool call it
-///   immediately follows.
+/// - Any other failure carries no call key, so it pairs with the tool call
+///   it immediately follows: in practice a Codex aborted turn, or the demo.
 ///
-/// Codex tool output is not recorded at all, so a Codex session is only seen
-/// failing through an aborted turn. The scan runs backwards and stops at the
-/// first call that did not fail, so it is cheap enough to ask every frame.
+/// Archive records are steps and failures, never tool calls, so an archive
+/// session is never marked stuck. Codex tool output is not recorded, so a
+/// Codex session is only seen failing through an aborted turn. The scan runs
+/// backwards and stops at the first call that did not fail, so it is cheap
+/// enough to ask every frame.
 pub(crate) fn stuck_run(records: &[&Event]) -> Option<Run> {
     // Call keys answered by a keyed failure later in the session than the scan point.
     let mut answered: Vec<&str> = Vec::new();
