@@ -529,9 +529,19 @@ impl std::fmt::Display for HttpUrl {
 pub(crate) fn http_get(url: &HttpUrl, deadline: Duration, cap: usize) -> Result<String, String> {
     use std::net::{TcpStream, ToSocketAddrs};
     let until = Instant::now() + deadline;
-    let addrs = (url.host.as_str(), url.port)
-        .to_socket_addrs()
-        .map_err(|_| format!("cannot resolve {}", url.host))?;
+    // The resolver has no timeout of its own, so it runs on a thread that is
+    // left behind if it has not answered by the deadline.
+    let (answer, resolved) = std::sync::mpsc::channel();
+    let target = (url.host.clone(), url.port);
+    std::thread::spawn(move || {
+        let found = target.to_socket_addrs().map(|a| a.collect::<Vec<_>>());
+        let _ = answer.send(found);
+    });
+    let addrs = resolved
+        .recv_timeout(deadline)
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| format!("cannot resolve {}", url.host))?;
     let mut stream = None;
     for addr in addrs {
         let left = until.saturating_duration_since(Instant::now());

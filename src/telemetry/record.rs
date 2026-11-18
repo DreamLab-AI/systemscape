@@ -175,6 +175,24 @@ fn parse(text: &str) -> History {
     history
 }
 
+/// Whether a directory is this user's alone. The mode asked for at creation
+/// does not apply to a directory that already existed, and one that others
+/// can write to lets them replace the history file.
+fn private(dir: &File) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = dir
+        .metadata()
+        .map_err(|e| format!("cannot be checked: {e}"))?;
+    let me = fs::metadata("/proc/self").map(|m| m.uid());
+    if me.is_ok_and(|uid| uid != meta.uid()) {
+        return Err("belongs to another user".into());
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err("is writable by other users (chmod 700 it to record)".into());
+    }
+    Ok(())
+}
+
 /// Read up to `READ_CAP` bytes from the end of a file that must be a regular
 /// file, not a link. A read that starts mid-file drops the partial first line.
 fn read_tail(path: &Path) -> std::io::Result<Option<String>> {
@@ -189,7 +207,18 @@ fn read_tail(path: &Path) -> std::io::Result<Option<String>> {
         ));
     }
     let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
+    // The entry checked above could have been swapped before the open: read
+    // only if what was opened is that same regular file.
+    let opened = file.metadata()?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err(std::io::Error::other(
+                "the file changed while it was opened",
+            ));
+        }
+    }
+    let len = opened.len();
     let start = len.saturating_sub(READ_CAP);
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::with_capacity((len - start) as usize);
@@ -329,6 +358,7 @@ impl Recorder {
             .create(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let handle = File::open(dir).map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+        private(&handle).map_err(|why| format!("{} {why}", dir.display()))?;
         match handle.try_lock() {
             Ok(()) => Ok(handle),
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -649,5 +679,17 @@ mod tests {
         );
         drop(first);
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+    #[test]
+    fn a_state_directory_others_can_write_to_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("systemscape-private-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private(&File::open(&dir).unwrap()).is_ok());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = private(&File::open(&dir).unwrap()).unwrap_err();
+        assert!(refused.contains("writable by other users"), "{refused}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
