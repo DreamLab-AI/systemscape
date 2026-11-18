@@ -12,6 +12,7 @@ pub(crate) use gemini_engine::{
 };
 mod activity;
 mod activity_data;
+mod alerts;
 mod hosts;
 mod pixels;
 mod telemetry;
@@ -187,6 +188,7 @@ enum TelemetryMode {
     View {
         demo: bool,
         hosts: Option<std::path::PathBuf>,
+        alerts: Option<std::path::PathBuf>,
     },
     Probe {
         interval: std::time::Duration,
@@ -196,7 +198,7 @@ enum TelemetryMode {
 
 /// Parse the telemetry options (everything except `--activity` runs).
 fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
-    let (mut demo, mut probe, mut hosts) = (false, false, None);
+    let (mut demo, mut probe, mut hosts, mut alerts) = (false, false, None, None);
     let (mut interval, mut gpu_interval) = (None, None);
     let mut rest = args.iter().skip(1);
     let seconds = |flag: &str, value: Option<&String>| -> Result<f64, String> {
@@ -213,13 +215,14 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
                 let path = rest.next().ok_or("--hosts needs a file path")?;
                 hosts = Some(std::path::PathBuf::from(path));
             }
+            "--alerts" => alerts = Some(rest.next().ok_or("--alerts needs a file path")?.into()),
             "--interval" => interval = Some(seconds(arg, rest.next())?),
             "--gpu-interval" => gpu_interval = Some(seconds(arg, rest.next())?),
             other => return Err(format!("unknown telemetry option {other}; see --help")),
         }
     }
     if probe {
-        if demo || hosts.is_some() {
+        if demo || hosts.is_some() || alerts.is_some() {
             return Err("--probe takes only --interval and --gpu-interval".into());
         }
         let interval = interval.unwrap_or(2.0);
@@ -237,7 +240,11 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
     if demo && hosts.is_some() {
         return Err("--demo is synthetic and cannot be combined with --hosts".into());
     }
-    Ok(TelemetryMode::View { demo, hosts })
+    Ok(TelemetryMode::View {
+        demo,
+        hosts,
+        alerts,
+    })
 }
 
 /// Modes other than telemetry: the first flag present on the command line
@@ -279,9 +286,15 @@ fn main() {
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             other => other,
         },
-        Ok(TelemetryMode::View { demo, hosts }) => {
-            telemetry::run(telemetry::Options { demo, hosts })
-        }
+        Ok(TelemetryMode::View {
+            demo,
+            hosts,
+            alerts,
+        }) => telemetry::run(telemetry::Options {
+            demo,
+            hosts,
+            alerts,
+        }),
     };
     if let Err(error) = result {
         eprintln!("systemscape: {error}");
@@ -323,14 +336,24 @@ mod tests {
             mode(&argv("")),
             Ok(TelemetryMode::View {
                 demo: false,
-                hosts: None
+                hosts: None,
+                alerts: None
             })
         );
         assert_eq!(
             mode(&argv("--hosts /etc/h.toml")),
             Ok(TelemetryMode::View {
                 demo: false,
-                hosts: Some("/etc/h.toml".into())
+                hosts: Some("/etc/h.toml".into()),
+                alerts: None
+            })
+        );
+        assert_eq!(
+            mode(&argv("--alerts /etc/a.toml")),
+            Ok(TelemetryMode::View {
+                demo: false,
+                hosts: None,
+                alerts: Some("/etc/a.toml".into())
             })
         );
         assert_eq!(
@@ -352,6 +375,8 @@ mod tests {
             "--hosts",
             "--probe --demo",
             "--probe --hosts x",
+            "--probe --alerts x",
+            "--alerts",
             "--interval 2",
             "--demo --hosts x",
             "--probe --interval 0",

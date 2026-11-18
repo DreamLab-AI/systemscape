@@ -952,6 +952,8 @@ pub struct Options {
     pub demo: bool,
     /// An explicit hosts file; otherwise the default path is used if present.
     pub hosts: Option<std::path::PathBuf>,
+    /// An explicit alerts file; otherwise the default path is used if present.
+    pub alerts: Option<std::path::PathBuf>,
 }
 
 /// `--probe`: print one snapshot of this machine per line until stdout
@@ -1128,6 +1130,17 @@ pub fn run(options: Options) -> std::io::Result<()> {
         None => (Some(String::new()), Vec::new()),
         Some(f) => (f.local, f.hosts),
     };
+    // Alert rules are checked against the host names before anything starts.
+    let names: Vec<(String, bool)> = (local_name.iter().map(|n| (n.clone(), false)))
+        .chain(remotes.iter().map(|h| (h.name.clone(), true)))
+        .collect();
+    let mut alerts = crate::alerts::Alerts::telemetry(
+        options.alerts.as_deref(),
+        options.demo,
+        &names,
+        !remotes.is_empty() || local_name.is_none(),
+    )
+    .map_err(std::io::Error::other)?;
 
     let (tx, rx) = mpsc::channel();
     // nvidia-smi takes tens of milliseconds; polling off-thread keeps frames even.
@@ -1223,6 +1236,15 @@ pub fn run(options: Options) -> std::io::Result<()> {
                 dirty = true;
             }
         }
+        // Rules keep evaluating off screen, as the sensors keep sampling.
+        if alerts.due() {
+            let readings = sources.iter().map(|s| crate::alerts::HostReading {
+                name: s.name.clone(),
+                remote_live: matches!(s.feed, Feed::Remote(_)).then_some(s.link == Link::Live),
+                readings: s.channels.iter().map(|c| (c.label(), c.now)).collect(),
+            });
+            dirty |= alerts.observe_telemetry(readings.collect(), visible) && visible;
+        }
         // The flight animates only while the view has the keyboard; visible
         // but unfocused it holds still and redraws twice a second.
         let flying = camera.fly && sight.focused();
@@ -1242,18 +1264,16 @@ pub fn run(options: Options) -> std::io::Result<()> {
                 selected,
             });
             let shown = &sources[selected];
-            buffer.present_rows(
-                render(
-                    &shown.channels,
-                    &shown.snapshot,
-                    &camera,
-                    scroll,
-                    dims,
-                    flat,
-                    bar.as_ref(),
-                ),
-                dims,
-            )?;
+            let rows = render(
+                &shown.channels,
+                &shown.snapshot,
+                &camera,
+                scroll,
+                alerts.view_dims(dims),
+                flat,
+                bar.as_ref(),
+            );
+            buffer.present_rows(alerts.dress(rows, dims), dims)?;
             dirty = false;
             drawn = Instant::now();
         }
@@ -1311,6 +1331,7 @@ pub fn run(options: Options) -> std::io::Result<()> {
                     }
                 }
                 KeyCode::Char('f') => flat = !flat,
+                KeyCode::Char('!') => alerts.toggle_list(),
                 _ => {}
             }
         }
@@ -1597,6 +1618,14 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn every_ridge_label_names_a_channel_alert_rules_accept() {
+        for channel in channels_for(12) {
+            let label = channel.label();
+            assert_eq!(crate::alerts::channel_label(&label), Ok(label));
+        }
     }
 
     #[test]
