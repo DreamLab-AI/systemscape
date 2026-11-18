@@ -1077,7 +1077,9 @@ fn render_city(
         canvas.label(col + 4, row + 1, &lines[1], Mark::of(newest).hue());
         canvas.label(col + 4, row + 2, &lines[2], MUTED);
         if let Some(energy) = heat::session_energy(&heat, &session.records) {
-            canvas.label(col + 4, row + 3, &fit(&energy.short(), widest), MUTED);
+            if row + 3 < scene_bottom {
+                canvas.label(col + 4, row + 3, &fit(&energy.short(), widest), MUTED);
+            }
         }
         callout = Some((col, row, longest + 4));
     }

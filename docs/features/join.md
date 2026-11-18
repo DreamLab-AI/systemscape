@@ -132,9 +132,13 @@ no process names, no host names.
   read-only filesystem, a missing `HOME` or a link at the final path gives a
   status-line note (`record: …`). The view carries on. A probe prints the
   problem once to stderr and keeps sending readings.
-- **The view records only this machine.** To record another host, give that
-  host's probe `--record` (in its `probe` command); its file is written on
-  that host.
+- **The view records only this machine.** With a hosts file that lists no
+  local machine, `--record` records nothing. A hosts file's `probe` entry must
+  be a plain path, and the viewer starts it as `probe --probe --interval …`
+  without `--record`. To record another host, run
+  `systemscape --probe --record > /dev/null` on that host itself, for example
+  as a user service. Its file is written on that host, and the viewer's own
+  probe there runs alongside it, because only recorders take the lock.
 - `--record` is refused with `--demo`, so synthetic readings can never reach
   the real history. It is also refused with `--activity`. Recording never
   changes the ridges: each view still starts with an empty two-hour window,
@@ -172,6 +176,10 @@ When two lines describe the same slot, the later one wins.
 - "The probe needs no terminal, configuration or privileges, and reads the same
   sources as the local view." Suggested addition: "With `--record` it also
   writes this machine's history to its own state directory."
+- "**Background tabs do no work.** … telemetry stops drawing but keeps
+  sampling". With `--record` a background telemetry view also rewrites the
+  history file once per 150 s slot. Suggested addition: "With `--record`, it
+  also writes each closed slot to the history file."
 - "SystemScape is designed to work as an immutable image package." Suggested
   addition: "`--record` needs a writable `$XDG_STATE_HOME` or
   `~/.local/state`; without one, telemetry shows a note and records nothing."
@@ -260,6 +268,15 @@ existed at that moment.
 
 `m` and `e` were free on this tree. `--no-marks` is refused with `--probe`;
 `--record` is refused with `--demo` and `--activity`.
+
+## Write volume
+
+Each slot rewrites the whole file through a temporary file and a rename,
+rather than appending in place. That is what makes the final path safe from
+links and partial writes without the `O_NOFOLLOW` flag, which std does not
+expose portably. The cost grows with the file: at the 14-day cap, about 1 MiB
+is written every 150 s, roughly 0.6 GiB a day. A history only a few days old
+costs a fraction of that.
 
 ## What this does not claim
 
