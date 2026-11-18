@@ -18,6 +18,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod city_links;
+mod family;
+mod replay;
+
+pub use replay::cast;
 
 const FRAME_MS: u64 = 55; // ~18 FPS while the tour is flying
 const POLL: Duration = Duration::from_secs(2);
@@ -168,6 +172,8 @@ struct State {
     coverage: bool,
     strip: bool,
     links: city_links::Show,
+    /// A replay of one day at a cut-off time; `None` is the live view.
+    replay: Option<replay::Replay>,
 }
 
 impl Default for State {
@@ -188,6 +194,7 @@ impl Default for State {
             coverage: false,
             strip: true,
             links: city_links::Show::default(),
+            replay: None,
         }
     }
 }
@@ -237,6 +244,9 @@ struct City<'a> {
     days: Vec<&'a str>,
     index: usize,
     sessions: Vec<Session<'a>>,
+    /// While replaying, the whole day's tower scale and tallest tower height,
+    /// so towers grow into a fixed skyline instead of rescaling.
+    fixed: Option<(f64, f64)>,
 }
 
 fn seconds(at: &str) -> f64 {
@@ -310,6 +320,7 @@ fn city<'a>(events: &'a [Event], state: &mut State) -> City<'a> {
         days,
         index,
         sessions,
+        fixed: None,
     }
 }
 
@@ -358,7 +369,7 @@ fn step_day(state: &mut State, city: &City<'_>, delta: isize) {
 /// Tour: fly, and every few seconds move on to the next active session, or to
 /// the next session of any kind when nothing is active.
 fn tour_step(events: &[Event], state: &mut State, dt: f64, now: f64) {
-    if !state.tour {
+    if !state.tour || state.replay.is_some() {
         return;
     }
     let dt = dt.clamp(0.0, 1.0);
@@ -421,7 +432,8 @@ struct Layout {
 }
 
 /// Districts run left to right in order of recent activity; within a district
-/// the most recent sessions stand at the front.
+/// the most recent sessions stand at the front, and a subagent stands beside
+/// its parent in the same row (see `family`).
 fn layout(city: &City<'_>, stretch: f64) -> Layout {
     let visible = city.sessions.len().min(MAX_TOWERS);
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
@@ -444,17 +456,23 @@ fn layout(city: &City<'_>, stretch: f64) -> Layout {
     let depth = rows as f64 * PITCH;
     let (margin, gap) = (0.5 * stretch, 1.8 * stretch);
     let pitch = PITCH * stretch;
-    let width: f64 = groups
+    // Subagents stand beside their parents, which may leave gaps in the grid.
+    let slots: Vec<Vec<usize>> = groups
         .iter()
-        .map(|(_, members)| members.len().div_ceil(rows) as f64 * pitch + 2.0 * margin)
+        .map(|(_, members)| family::slots(&city.sessions, members, rows))
+        .collect();
+    let columns = |slots: &[usize]| slots.iter().max().map_or(0, |s| s / rows + 1);
+    let width: f64 = slots
+        .iter()
+        .map(|slots| columns(slots) as f64 * pitch + 2.0 * margin)
         .sum::<f64>()
         + gap * groups.len().saturating_sub(1) as f64;
     // The camera looks down -z with a left-handed view: screen-right is world -x.
     let to_x = |p: f64| width / 2.0 - p;
     let (mut towers, mut districts, mut cursor) = (Vec::new(), Vec::new(), 0.0);
-    for (name, members) in groups {
-        let span = members.len().div_ceil(rows) as f64 * pitch + 2.0 * margin;
-        for (i, session) in members.into_iter().enumerate() {
+    for ((name, members), slots) in groups.into_iter().zip(slots) {
+        let span = columns(&slots) as f64 * pitch + 2.0 * margin;
+        for (session, i) in members.into_iter().zip(slots) {
             towers.push(Tower {
                 session,
                 x: to_x(cursor + margin + ((i / rows) as f64 + 0.5) * pitch),
@@ -583,6 +601,9 @@ fn height_cap(lay: &Layout) -> f64 {
 /// Scale applied to every visible tower so the tallest reaches `height_cap`.
 /// Towers are never stretched: a quiet day stays a low skyline.
 fn tower_scale(city: &City<'_>, lay: &Layout) -> f64 {
+    if let Some((scale, _)) = city.fixed {
+        return scale;
+    }
     let tallest = lay
         .towers
         .iter()
@@ -812,21 +833,29 @@ fn header(canvas: &mut PixelCanvas, city: &City<'_>, state: &State, demo: bool, 
         .filter(|s| now - s.last < LIVE_SECS)
         .count();
     canvas.label(1, 0, "SYSTEMSCAPE WORK", (63, 235, 255));
+    let mut col = 19;
+    if let Some(banner) = replay::banner(state) {
+        canvas.label(col, 0, &banner, GOLD);
+        col += banner.chars().count() as i64 + 3;
+    }
     canvas.label(
-        19,
+        col,
         0,
         &format!(
-            "{} (day {}/{}) · {} sessions · {} projects · {} active · {}{}",
+            "{} (day {}/{}) · {} sessions · {} projects · {} active{}{}",
             city.day,
             city.index + 1,
             city.days.len().max(1),
             city.sessions.len(),
             projects.len(),
             active,
-            if state.tour {
-                "FOLLOWING LIVE"
+            // A replay names itself in the banner instead.
+            if state.replay.is_some() {
+                ""
+            } else if state.tour {
+                " · FOLLOWING LIVE"
             } else {
-                "MANUAL"
+                " · MANUAL"
             },
             if demo { " · DEMO" } else { "" }
         ),
@@ -930,7 +959,7 @@ fn city_view(
         lay.towers
             .iter()
             .map(|t| raw_height(&city.sessions[t.session]) * scale)
-            .fold(1.0, f64::max)
+            .fold(city.fixed.map_or(1.0, |(_, tallest)| tallest), f64::max)
     };
     let distance = |lay: &Layout| fit_distance(lay, tallest_of(lay), yaw, lift, centre, frame);
     let plain = layout(city, 1.0);
@@ -1341,13 +1370,18 @@ fn render(
     demo: bool,
     now: f64,
 ) -> Vec<String> {
-    let city = city(events, state);
-    let links = city_links::Links::build(events, &city, state.links, now);
-    if state.flat || dims.0 < 80 || dims.1 < 20 {
+    // A replay hands everything below the history and `now` of its cut-off.
+    let (events, now, fixed) = replay::window(events, state, now);
+    let mut city = city(&events, state);
+    city.fixed = fixed;
+    let links = city_links::Links::build(&events, &city, state.links, now);
+    let mut rows = if state.flat || dims.0 < 80 || dims.1 < 20 {
         render_flat(&city, &links, coverage, state, dims, demo, now)
     } else {
         render_city(&city, &links, coverage, state, dims, demo, now)
-    }
+    };
+    replay::footer(state, dims, &mut rows);
+    rows
 }
 
 fn unix_now() -> f64 {
@@ -1369,6 +1403,9 @@ fn handle_key(state: &mut State, key: KeyEvent, events: &[Event], in_list: bool)
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit;
     }
+    if let Some(action) = replay::handle_key(state, key, events) {
+        return action;
+    }
     if key.modifiers.is_empty() && city_links::toggle(&mut state.links, key.code) {
         return Action::Redraw; // a view toggle, like `h`, leaves the tour flying
     }
@@ -1378,7 +1415,8 @@ fn handle_key(state: &mut State, key: KeyEvent, events: &[Event], in_list: bool)
     ) {
         state.tour = false;
     }
-    let city = city(events, state);
+    let window = replay::cut(events, state);
+    let city = city(&window, state);
     // In the city, only drawn towers can be selected.
     let count = if in_list {
         city.sessions.len()
@@ -1580,6 +1618,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         // The tour animates only while the view has the keyboard. Visible but
         // unfocused, it stays current and redraws twice a second.
         let flying = sight.focused() && state.tour && !in_list;
+        let playing = sight.focused() && replay::playing(&state);
         if visible && last_frame.elapsed() >= Duration::from_millis(FRAME_MS) {
             let dt = if flying {
                 last_frame.elapsed().as_secs_f64()
@@ -1587,11 +1626,13 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 0.0
             };
             tour_step(&events, &mut state, dt, now);
+            replay::advance(&mut state, &events, last_frame.elapsed().as_secs_f64());
             last_frame = Instant::now();
         }
         // A new or resized pane is always drawn once, so it is never blank.
         if buffer.dims != dims
-            || visible && (dirty || flying || drawn.elapsed() >= Duration::from_millis(500))
+            || visible
+                && (dirty || flying || playing || drawn.elapsed() >= Duration::from_millis(500))
         {
             let view = alerts.view_dims(dims);
             let rows = render(&events, &coverage, &mut state, view, demo, now);
@@ -1599,7 +1640,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             dirty = false;
             drawn = Instant::now();
         }
-        let wait = match (visible, flying) {
+        let wait = match (visible, flying || playing) {
             (false, _) => Duration::from_secs(2),
             (true, true) => Duration::from_millis(FRAME_MS),
             (true, false) => Duration::from_millis(250),
