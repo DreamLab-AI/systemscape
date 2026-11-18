@@ -14,6 +14,7 @@ mod activity;
 mod activity_data;
 mod hosts;
 mod pixels;
+mod sensors;
 mod telemetry;
 
 /// Restore terminal state on normal exit, errors and unwinding.
@@ -187,6 +188,7 @@ enum TelemetryMode {
     View {
         demo: bool,
         hosts: Option<std::path::PathBuf>,
+        extras: sensors::Extras,
     },
     Probe {
         interval: std::time::Duration,
@@ -198,6 +200,7 @@ enum TelemetryMode {
 fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
     let (mut demo, mut probe, mut hosts) = (false, false, None);
     let (mut interval, mut gpu_interval) = (None, None);
+    let mut extras = sensors::Extras::default();
     let mut rest = args.iter().skip(1);
     let seconds = |flag: &str, value: Option<&String>| -> Result<f64, String> {
         value
@@ -215,11 +218,16 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
             }
             "--interval" => interval = Some(seconds(arg, rest.next())?),
             "--gpu-interval" => gpu_interval = Some(seconds(arg, rest.next())?),
+            "--containers" => extras.containers = true,
+            "--llama-metrics" => {
+                let url = rest.next().ok_or("--llama-metrics needs an http:// URL")?;
+                extras.llama = Some(sensors::HttpUrl::parse(url)?);
+            }
             other => return Err(format!("unknown telemetry option {other}; see --help")),
         }
     }
     if probe {
-        if demo || hosts.is_some() {
+        if demo || hosts.is_some() || extras != sensors::Extras::default() {
             return Err("--probe takes only --interval and --gpu-interval".into());
         }
         let interval = interval.unwrap_or(2.0);
@@ -237,7 +245,14 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
     if demo && hosts.is_some() {
         return Err("--demo is synthetic and cannot be combined with --hosts".into());
     }
-    Ok(TelemetryMode::View { demo, hosts })
+    if demo && extras != sensors::Extras::default() {
+        return Err("--demo is synthetic and runs neither docker nor network requests".into());
+    }
+    Ok(TelemetryMode::View {
+        demo,
+        hosts,
+        extras,
+    })
 }
 
 /// Modes other than telemetry: the first flag present on the command line
@@ -279,9 +294,15 @@ fn main() {
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             other => other,
         },
-        Ok(TelemetryMode::View { demo, hosts }) => {
-            telemetry::run(telemetry::Options { demo, hosts })
-        }
+        Ok(TelemetryMode::View {
+            demo,
+            hosts,
+            extras,
+        }) => telemetry::run(telemetry::Options {
+            demo,
+            hosts,
+            extras,
+        }),
     };
     if let Err(error) = result {
         eprintln!("systemscape: {error}");
@@ -323,14 +344,16 @@ mod tests {
             mode(&argv("")),
             Ok(TelemetryMode::View {
                 demo: false,
-                hosts: None
+                hosts: None,
+                extras: Default::default(),
             })
         );
         assert_eq!(
             mode(&argv("--hosts /etc/h.toml")),
             Ok(TelemetryMode::View {
                 demo: false,
-                hosts: Some("/etc/h.toml".into())
+                hosts: Some("/etc/h.toml".into()),
+                extras: Default::default(),
             })
         );
         assert_eq!(
@@ -357,6 +380,42 @@ mod tests {
             "--probe --interval 0",
             "--probe --interval soon",
             "--bogus",
+        ] {
+            assert!(mode(&argv(bad)).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn sensor_flags_parse_and_senseless_combinations_are_refused() {
+        use super::{sensors, telemetry_mode as mode, TelemetryMode};
+        let argv = |line: &str| {
+            std::iter::once("systemscape")
+                .chain(line.split_whitespace())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let url = sensors::HttpUrl::parse("http://127.0.0.1:8085/metrics").unwrap();
+        assert_eq!(
+            mode(&argv(
+                "--containers --llama-metrics http://127.0.0.1:8085/metrics --hosts h.toml"
+            )),
+            Ok(TelemetryMode::View {
+                demo: false,
+                hosts: Some("h.toml".into()),
+                extras: sensors::Extras {
+                    containers: true,
+                    llama: Some(url),
+                },
+            })
+        );
+        for bad in [
+            "--llama-metrics",
+            "--llama-metrics https://host/metrics",
+            "--llama-metrics host:8085",
+            "--probe --containers",
+            "--probe --llama-metrics http://host/metrics",
+            "--demo --containers",
+            "--demo --llama-metrics http://host/metrics",
         ] {
             assert!(mode(&argv(bad)).is_err(), "{bad} should be refused");
         }
