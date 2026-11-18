@@ -17,6 +17,8 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod city_links;
+
 const FRAME_MS: u64 = 55; // ~18 FPS while the tour is flying
 const POLL: Duration = Duration::from_secs(2);
 const MAX_TOWERS: usize = 36;
@@ -165,6 +167,7 @@ struct State {
     detail: bool,
     coverage: bool,
     strip: bool,
+    links: city_links::Show,
 }
 
 impl Default for State {
@@ -184,6 +187,7 @@ impl Default for State {
             detail: false,
             coverage: false,
             strip: true,
+            links: city_links::Show::default(),
         }
     }
 }
@@ -707,7 +711,7 @@ fn tidy_home(text: &str, home: &str) -> String {
 }
 
 fn short(id: &str) -> String {
-    id.chars().take(8).collect()
+    city_links::short_id(id)
 }
 
 /// Match gemini-engine's perspective transform, to place text labels over the
@@ -962,6 +966,7 @@ fn scene_frame(
 /// the most recently active sessions.
 fn render_city(
     city: &City<'_>,
+    links: &city_links::Links<'_>,
     coverage: &str,
     state: &mut State,
     dims: (usize, usize),
@@ -992,9 +997,24 @@ fn render_city(
     let radius = fitted * state.dolly;
     let angle = state.yaw + SWAY * (state.t * 0.11).sin();
     let viewport = city_camera(tallest, angle, radius, state.lift, centre);
-    let (ground, towers) = build_scene(city, &lay, state.selected, state.t, now);
+    let (ground, mut towers) = build_scene(city, &lay, state.selected, state.t, now);
+    let scene_rows = scene_bottom - scene_top;
+    let (ghost, roads, drawn) =
+        city_links::scene(city, links, &lay, scale, tallest, scene_rows, &mut towers);
     let mut viewport = viewport;
-    for mesh in [ground, towers] {
+    for (mesh, wire) in [
+        (ground, false),
+        (ghost, true),
+        (roads, false),
+        (towers, false),
+    ] {
+        viewport.display_mode = if wire {
+            DisplayMode::Wireframe {
+                backface_culling: false,
+            }
+        } else {
+            DisplayMode::Solid
+        };
         viewport.objects = vec![clip_scene(mesh, &viewport, (width, height))];
         gemini_engine::core::CanDraw::draw_to(&viewport, &mut canvas);
     }
@@ -1087,6 +1107,11 @@ fn render_city(
             MUTED,
         );
     }
+    if !state.coverage {
+        // The overlay key shares the row, clear of the note on hidden sessions.
+        let from = if lay.hidden > 0 { 44 } else { 0 };
+        city_links::key(&mut canvas, links, &drawn, 2, from, columns);
+    }
     if city.sessions.is_empty() {
         canvas.label(
             1,
@@ -1119,7 +1144,7 @@ fn render_city(
             canvas.label(
                 5,
                 row,
-                &fit(session.agent, 16),
+                &fit(&city_links::who(session), 16),
                 if chosen { BRIGHT } else { MUTED },
             );
             canvas.label(22, row, &fit(district_name(session.project), 18), MUTED);
@@ -1148,6 +1173,7 @@ fn render_city(
 /// selected session, newest first. Also the layout for small panes.
 fn render_flat(
     city: &City<'_>,
+    links: &city_links::Links<'_>,
     coverage: &str,
     state: &mut State,
     dims: (usize, usize),
@@ -1191,7 +1217,7 @@ fn render_flat(
         canvas.label(
             7,
             row,
-            &fit(each.agent, 14),
+            &fit(&city_links::who(each), 14),
             if chosen { BRIGHT } else { MUTED },
         );
         canvas.label(
@@ -1238,7 +1264,13 @@ fn render_flat(
 
     // Records of the selected session, newest first.
     let chosen_record = record_index(state, session);
-    let space = (rows - below - 5).max(1) as usize;
+    // A line about the session's links, when the pane has rows to spare.
+    let note = city_links::note(city, links, state.selected, columns.saturating_sub(2))
+        .filter(|_| rows - below - 6 >= 3);
+    let space = (rows - below - 5 - i64::from(note.is_some())).max(1) as usize;
+    if let Some(note) = &note {
+        canvas.label(1, rows - 5, note, mix(GOLD, MUTED, 0.4));
+    }
     let first = (chosen_record + 1).saturating_sub(space);
     for (line, (i, record)) in session
         .records
@@ -1308,10 +1340,11 @@ fn render(
     now: f64,
 ) -> Vec<String> {
     let city = city(events, state);
+    let links = city_links::Links::build(events, &city, state.links, now);
     if state.flat || dims.0 < 80 || dims.1 < 20 {
-        render_flat(&city, coverage, state, dims, demo, now)
+        render_flat(&city, &links, coverage, state, dims, demo, now)
     } else {
-        render_city(&city, coverage, state, dims, demo, now)
+        render_city(&city, &links, coverage, state, dims, demo, now)
     }
 }
 
@@ -1333,6 +1366,9 @@ enum Action {
 fn handle_key(state: &mut State, key: KeyEvent, events: &[Event], in_list: bool) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit;
+    }
+    if key.modifiers.is_empty() && city_links::toggle(&mut state.links, key.code) {
+        return Action::Redraw; // a view toggle, like `h`, leaves the tour flying
     }
     if !matches!(
         key.code,
@@ -1584,7 +1620,7 @@ mod tests {
     use super::*;
     use crate::activity_data::demo_events;
 
-    fn plain(rows: &[String]) -> String {
+    pub(super) fn plain(rows: &[String]) -> String {
         let mut text = String::new();
         for row in rows {
             let mut escape = false;
