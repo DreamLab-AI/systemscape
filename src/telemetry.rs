@@ -219,7 +219,7 @@ impl Snapshot {
 }
 
 #[derive(Default)]
-struct RateState {
+pub(crate) struct RateState {
     disk_bytes: u64,
     net_bytes: u64,
     sampled_at: Option<Instant>,
@@ -350,7 +350,11 @@ fn query_gpus() -> Vec<Gpu> {
     }
 }
 
-fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState, gpus: bool) -> Snapshot {
+pub(crate) fn poll_sensors(
+    prev_cpu: &mut (u64, u64),
+    rates: &mut RateState,
+    gpus: bool,
+) -> Snapshot {
     let mut s = Snapshot::default();
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         let mut hwmons: Vec<_> = entries.flatten().map(|e| e.path()).collect();

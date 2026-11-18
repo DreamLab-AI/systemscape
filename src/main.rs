@@ -13,7 +13,11 @@ pub(crate) use gemini_engine::{
 mod activity;
 mod activity_data;
 mod hosts;
+mod insight;
+mod mcp;
+mod metrics;
 mod pixels;
+mod report;
 mod telemetry;
 
 /// Restore terminal state on normal exit, errors and unwinding.
@@ -244,7 +248,14 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
 /// picks the mode, which then parses the whole command line itself. A new
 /// mode is one line here.
 type Mode = fn(&[String]) -> std::io::Result<()>;
-const MODES: &[(&str, Mode)] = &[("--activity", activity::run)];
+const MODES: &[(&str, Mode)] = &[
+    // Insight outputs come before `--activity`, which they also accept.
+    ("--summary", report::summary),
+    ("--status", report::status),
+    ("--mcp", mcp::run),
+    ("--metrics", metrics::run),
+    ("--activity", activity::run),
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

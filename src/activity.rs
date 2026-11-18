@@ -211,10 +211,12 @@ impl Session<'_> {
         self.records[self.records.len() - 1]
     }
 
-    /// Status dot: a recent failure, recent activity, or idle.
+    /// Status dot: stuck on a repeated failure, a recent failure, recent activity, or idle.
     fn status(&self, now: f64) -> (char, Rgb) {
         let age = now - self.last;
-        if Mark::of(self.newest()) == Mark::Failure && age < 3.0 * LIVE_SECS {
+        if crate::insight::stuck_run(&self.records).is_some() {
+            ('↻', RED)
+        } else if Mark::of(self.newest()) == Mark::Failure && age < 3.0 * LIVE_SECS {
             ('!', RED)
         } else if age < LIVE_SECS {
             ('●', GREEN)
@@ -1107,7 +1109,7 @@ fn render_city(
         canvas.label(
             14,
             scene_bottom,
-            "● record in the last 5 min   ○ idle   ! ended on an error",
+            "● record in the last 5 min   ○ idle   ! ended on an error   ↻ stuck",
             (86, 100, 120),
         );
         for (i, session) in city.sessions.iter().take((strip - 1) as usize).enumerate() {
@@ -2055,5 +2057,33 @@ mod tests {
         assert_eq!(marks, vec![Mark::Failure, Mark::Receipt]);
         let total: f64 = floors.iter().map(|(h, _)| h).sum();
         assert!((total - (0.4 + 0.4 + 0.5 + 0.5) * 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stuck_session_is_marked_in_the_strip_and_the_list_at_every_size() {
+        // The demo's 77e385bc session repeats one failing command three times.
+        let events = demo_events();
+        let now = unix_now();
+        for (dims, flat) in [
+            ((120, 38), false),
+            ((165, 35), false),
+            ((200, 65), false),
+            ((47, 27), true),
+            ((80, 24), true),
+            ((120, 40), true),
+        ] {
+            let mut state = State {
+                flat,
+                ..State::default()
+            };
+            let text = plain(&render(&events, "fixture", &mut state, dims, true, now));
+            let marked: Vec<&str> = text.lines().filter(|l| l.contains('↻')).collect();
+            assert!(
+                marked.iter().any(|l| l.contains("codex")),
+                "{dims:?} flat={flat}: no stuck marker on the codex session"
+            );
+            let stuck_rows = marked.iter().filter(|l| !l.contains("stuck")).count();
+            assert_eq!(stuck_rows, 1, "{dims:?}: only the stuck session is marked");
+        }
     }
 }
