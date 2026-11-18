@@ -7,10 +7,8 @@ use crate::insight::{self, Digest};
 use crate::telemetry::{poll_sensors, Gpu, RateState, Snapshot};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Longest string an output keeps (paths are kept whole up to this).
@@ -265,122 +263,6 @@ impl Reading {
     }
 }
 
-/// What checking a recorded commit against its repository found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Receipt {
-    /// The repository has the commit.
-    Present,
-    /// The directory is a repository and does not have the commit.
-    Missing,
-    /// Not asked, or no clear answer: an invalid SHA or directory, not a
-    /// repository, git missing or slow, or past the check cap.
-    Unchecked,
-}
-
-/// At most this many git questions per run (each commit is one, and each
-/// repository adds one the first time).
-const VERIFY_CAP: usize = 48;
-const GIT_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Opt-in commit verification, the one place SystemScape opens a repository.
-/// git is run with an argv (never a shell), only for a SHA that is 7 to 64
-/// hex digits and a project that is an existing absolute directory, with a
-/// timeout and a per-run cap.
-pub(crate) struct Verifier {
-    budget: usize,
-    repos: HashMap<String, bool>,
-}
-
-impl Verifier {
-    pub(crate) fn new() -> Self {
-        Self {
-            budget: VERIFY_CAP,
-            repos: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn check(&mut self, project: &str, sha: &str) -> Receipt {
-        let dir = Path::new(project);
-        let valid_sha = (7..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
-        if !valid_sha || !dir.is_absolute() || !dir.is_dir() {
-            return Receipt::Unchecked;
-        }
-        let repo = match self.repos.get(project) {
-            Some(known) => *known,
-            None => {
-                let Some(answer) = self.git(dir, &["rev-parse", "--git-dir"]) else {
-                    return Receipt::Unchecked;
-                };
-                self.repos.insert(project.to_owned(), answer);
-                answer
-            }
-        };
-        if !repo {
-            return Receipt::Unchecked;
-        }
-        match self.git(dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]) {
-            Some(true) => Receipt::Present,
-            // In a known repository, cat-file -e fails only when the object
-            // is absent or is not a commit.
-            Some(false) => Receipt::Missing,
-            None => Receipt::Unchecked,
-        }
-    }
-
-    /// Run `git -C dir <args>` with no input or output. `Some(success)`, or
-    /// `None` when over budget, unable to start or past [`GIT_TIMEOUT`].
-    fn git(&mut self, dir: &Path, args: &[&str]) -> Option<bool> {
-        self.budget = self.budget.checked_sub(1)?;
-        // fsmonitor is the one repository setting that could start a program
-        // on a read; turn it off for these calls.
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "core.fsmonitor=false"])
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let deadline = Instant::now() + GIT_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status.success()),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-/// Check every commit in a digest, in the digest's order. `None` (demo, or
-/// the flag not given) marks every receipt unchecked without running git.
-pub(crate) fn verify_digest(
-    digest: &Digest,
-    verifier: Option<&mut Verifier>,
-) -> HashMap<(String, String), Receipt> {
-    let mut found = HashMap::new();
-    let mut verifier = verifier;
-    for session in digest.projects.iter().flat_map(|p| &p.sessions) {
-        for sha in &session.commits {
-            let receipt = verifier
-                .as_deref_mut()
-                .map_or(Receipt::Unchecked, |v| v.check(&session.project, sha));
-            found.insert((session.project.clone(), sha.clone()), receipt);
-        }
-    }
-    found
-}
-
 /// Clock time of a timestamp, `HH:MM`.
 fn clock(at: &str) -> &str {
     at.get(11..16).unwrap_or("?")
@@ -403,11 +285,7 @@ const COMMITS_SHOWN: usize = 4;
 
 /// The digest as plain text: totals, then stuck sessions and contended files
 /// called out, then each project and its most recent sessions.
-pub(crate) fn summary_text(
-    digest: &Digest,
-    coverage: &str,
-    receipts: Option<&HashMap<(String, String), Receipt>>,
-) -> Vec<String> {
+pub(crate) fn summary_text(digest: &Digest, coverage: &str) -> Vec<String> {
     let c = &digest.counts;
     let sessions: usize = digest.projects.iter().map(|p| p.sessions.len()).sum();
     let mut out = vec![
@@ -491,16 +369,7 @@ pub(crate) fn summary_text(
                     .commits
                     .iter()
                     .take(COMMITS_SHOWN)
-                    .map(|sha| {
-                        let short = fit(sha, 12);
-                        match receipts.and_then(|r| r.get(&(session.project.clone(), sha.clone())))
-                        {
-                            Some(Receipt::Present) => format!("{short} present"),
-                            Some(Receipt::Missing) => format!("{short} MISSING"),
-                            Some(Receipt::Unchecked) => format!("{short} unchecked"),
-                            None => short,
-                        }
-                    })
+                    .map(|sha| fit(sha, 12))
                     .collect();
                 if session.commits.len() > COMMITS_SHOWN {
                     listed.push(format!("+{}", session.commits.len() - COMMITS_SHOWN));
@@ -541,12 +410,12 @@ pub(crate) fn fit(text: &str, width: usize) -> String {
     cut
 }
 
-/// `systemscape [--activity] --summary [--day YYYY-MM-DD] [--json] [--verify-commits]`
+/// `systemscape [--activity] --summary [--day YYYY-MM-DD] [--json]`
 /// with the usual source flags. Prints the coverage line first, as the other
 /// one-shot outputs do (inside the object for `--json`).
 pub fn summary(args: &[String]) -> io::Result<()> {
     let mut sources = SourceFlags::new();
-    let (mut day, mut json, mut verify) = (None, false, false);
+    let (mut day, mut json) = (None, false);
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
         if sources.take(arg, &mut rest)? {
@@ -555,7 +424,6 @@ pub fn summary(args: &[String]) -> io::Result<()> {
         match arg.as_str() {
             "--summary" | "--activity" => {}
             "--json" => json = true,
-            "--verify-commits" => verify = true,
             "--day" => {
                 let value = rest
                     .next()
@@ -577,27 +445,12 @@ pub fn summary(args: &[String]) -> io::Result<()> {
         .or_else(|| insight::days(&events).first().map(|d| (*d).to_owned()))
         .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
     let digest = insight::digest(&events, &day);
-    // The demo's receipts are invented, so git is never asked about them.
-    let mut verifier = (verify && !sources.demo()).then(Verifier::new);
-    let receipts = verify.then(|| verify_digest(&digest, verifier.as_mut()));
     if json {
-        let commits: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .map(|((project, sha), receipt)| {
-                serde_json::json!({"project": project, "sha": sha, "receipt": receipt})
-            })
-            .collect();
-        let mut value = serde_json::json!({"coverage": coverage, "digest": digest});
-        if verify {
-            let mut commits = commits;
-            commits.sort_by_key(|c| (c["project"].to_string(), c["sha"].to_string()));
-            value["commits"] = commits.into();
-        }
+        let value = serde_json::json!({"coverage": coverage, "digest": digest});
         // Record paths are only stripped of controls by the collector.
         println!("{}", scrub_value(value));
     } else {
-        for line in summary_text(&digest, &coverage, receipts.as_ref()) {
+        for line in summary_text(&digest, &coverage) {
             println!("{line}");
         }
     }
@@ -755,7 +608,7 @@ mod tests {
         let events = demo_events();
         let day = insight::days(&events)[0].to_owned();
         let digest = insight::digest(&events, &day);
-        let lines = summary_text(&digest, DEMO_COVERAGE, None);
+        let lines = summary_text(&digest, DEMO_COVERAGE);
         assert_eq!(lines[0], DEMO_COVERAGE);
         assert!(lines[1].starts_with(&format!("Activity on {day} (UTC)")));
         assert!(lines
@@ -768,11 +621,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.ends_with("STUCK")));
         assert!(lines.len() <= 50, "{} lines", lines.len());
         assert!(lines.iter().all(|l| l.chars().count() <= 160));
-        assert_eq!(
-            lines,
-            summary_text(&digest, DEMO_COVERAGE, None),
-            "deterministic"
-        );
+        assert_eq!(lines, summary_text(&digest, DEMO_COVERAGE), "deterministic");
     }
 
     #[test]
@@ -786,111 +635,10 @@ mod tests {
             }
         }
         let digest = insight::digest(&events, "2026-11-18");
-        let lines = summary_text(&digest, "Sources: test", None);
+        let lines = summary_text(&digest, "Sources: test");
         assert!(lines.contains(&"… 6 more projects".to_owned()));
         assert!(lines.contains(&"  … 4 more sessions".to_owned()));
         assert!(lines.len() <= 55, "{} lines", lines.len());
-    }
-
-    #[test]
-    fn commit_verification_refuses_bad_input_before_running_git() {
-        let mut verifier = Verifier::new();
-        let budget = verifier.budget;
-        assert_eq!(verifier.check("/", "not-hex!"), Receipt::Unchecked);
-        assert_eq!(
-            verifier.check("/", "abc12"),
-            Receipt::Unchecked,
-            "too short"
-        );
-        assert_eq!(
-            verifier.check("relative/dir", "abcdef1"),
-            Receipt::Unchecked
-        );
-        assert_eq!(
-            verifier.check("/no/such/dir/here", "abcdef1"),
-            Receipt::Unchecked
-        );
-        assert_eq!(
-            verifier.check("/tmp;rm -rf x", "abcdef1"),
-            Receipt::Unchecked
-        );
-        assert_eq!(verifier.budget, budget, "git was never asked");
-    }
-
-    /// A throwaway repository with one commit; skipped where git is absent.
-    fn repository() -> Option<(PathBuf, String)> {
-        static ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "systemscape-verify-{}-{}",
-            std::process::id(),
-            ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).ok()?;
-        let git = |args: &[&str]| {
-            Command::new("git")
-                .arg("-C")
-                .arg(&dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
-                .args(["-c", "commit.gpgsign=false"])
-                .args(args)
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-        };
-        git(&["init", "-q"])?;
-        git(&["commit", "-q", "--allow-empty", "-m", "one"])?;
-        let sha = String::from_utf8(git(&["rev-parse", "HEAD"])?.stdout).ok()?;
-        Some((dir, sha.trim().to_owned()))
-    }
-
-    #[test]
-    fn a_recorded_commit_is_present_missing_or_unchecked() {
-        let Some((repo, sha)) = repository() else {
-            eprintln!("git unavailable; skipping");
-            return;
-        };
-        let plain = repo.with_extension("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        let project = repo.to_string_lossy().into_owned();
-        let mut verifier = Verifier::new();
-        assert_eq!(verifier.check(&project, &sha), Receipt::Present);
-        assert_eq!(
-            verifier.check(&project, &sha[..7]),
-            Receipt::Present,
-            "abbreviated"
-        );
-        assert_eq!(
-            verifier.check(&project, "0123456789abcdef0123456789abcdef01234567"),
-            Receipt::Missing
-        );
-        assert_eq!(
-            verifier.check(&plain.to_string_lossy(), &sha),
-            Receipt::Unchecked,
-            "not a repository is not the same as missing"
-        );
-        verifier.budget = 0;
-        assert_eq!(
-            verifier.check(&project, &sha),
-            Receipt::Unchecked,
-            "past the cap"
-        );
-        let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&plain);
-    }
-
-    #[test]
-    fn verification_marks_receipts_and_without_a_verifier_never_runs_git() {
-        let mut receipt = record("s", 10, "receipt", "Recorded commit abcdef1234");
-        receipt.project = "/no/such/project".into();
-        let digest = insight::digest(&[receipt], "2026-11-18");
-        let unchecked = verify_digest(&digest, None);
-        assert_eq!(
-            unchecked.get(&("/no/such/project".into(), "abcdef1234".into())),
-            Some(&Receipt::Unchecked)
-        );
-        let lines = summary_text(&digest, "Sources: test", Some(&unchecked));
-        assert!(lines.contains(&"    commits: abcdef1234 unchecked".to_owned()));
     }
 
     #[test]
@@ -911,7 +659,7 @@ mod tests {
         }
         assert_eq!(left, ["--tmux"]);
         assert!(flags.demo && failed, "--archive without a path is refused");
-        assert_eq!(flags.home.as_deref(), Some(Path::new("/h")));
+        assert_eq!(flags.home.as_deref(), Some(std::path::Path::new("/h")));
     }
 
     #[test]

@@ -10,8 +10,7 @@
 //! nothing a record contains is ever run.
 use crate::insight;
 use crate::report::{
-    fit, invalid, scrub, scrub_value, verify_digest, Receipt, Sensors, SourceFlags, Sources,
-    Verifier, STRING_LIMIT,
+    fit, invalid, scrub, scrub_value, Sensors, SourceFlags, Sources, STRING_LIMIT,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -209,15 +208,13 @@ fn capped<T: serde::Serialize>(items: &[T], limit: usize) -> (Value, usize) {
 pub(crate) struct Server {
     sources: Sources,
     sensors: Sensors,
-    verify: bool,
 }
 
 impl Server {
-    pub(crate) fn new(sources: Sources, verify: bool) -> Self {
+    pub(crate) fn new(sources: Sources) -> Self {
         Self {
             sources,
             sensors: Sensors::default(),
-            verify,
         }
     }
 
@@ -421,12 +418,6 @@ impl Server {
         let (events, coverage) = self.sources.load();
         let day = pick_day(args.day()?, &events);
         let mut digest = insight::digest(&events, &day);
-        let receipts = if self.verify && !self.sources.demo() {
-            let mut verifier = Verifier::new();
-            Some(verify_digest(&digest, Some(&mut verifier)))
-        } else {
-            None
-        };
         let projects = digest.projects.len();
         digest.projects.truncate(LIST_LIMIT);
         for project in &mut digest.projects {
@@ -434,19 +425,8 @@ impl Server {
         }
         digest.stuck.truncate(LIST_LIMIT);
         digest.contended.truncate(LIST_LIMIT);
-        let mut value = json!({"digest": digest, "coverage": coverage,
+        let value = json!({"digest": digest, "coverage": coverage,
                                "projects_left_out": projects - digest.projects.len()});
-        if let Some(receipts) = receipts {
-            let mut commits: Vec<_> = receipts.into_iter().collect();
-            commits.sort_by(|a, b| a.0.cmp(&b.0));
-            commits.truncate(LIST_LIMIT);
-            value["commits"] = commits
-                .into_iter()
-                .map(|((project, sha), receipt): ((String, String), Receipt)| {
-                    json!({"project": project, "sha": sha, "receipt": receipt})
-                })
-                .collect();
-        }
         Ok(value)
     }
 
@@ -546,10 +526,9 @@ fn serve(input: &mut impl BufRead, output: &mut impl Write, server: &mut Server)
     }
 }
 
-/// `systemscape --mcp [--verify-commits]` with the usual source flags.
+/// `systemscape --mcp` with the usual source flags.
 pub fn run(args: &[String]) -> io::Result<()> {
     let mut sources = SourceFlags::new();
-    let mut verify = false;
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
         if sources.take(arg, &mut rest)? {
@@ -557,11 +536,10 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         match arg.as_str() {
             "--mcp" | "--activity" => {}
-            "--verify-commits" => verify = true,
             other => return Err(invalid(format!("unknown --mcp option {other}; see --help"))),
         }
     }
-    let mut server = Server::new(sources.open(), verify);
+    let mut server = Server::new(sources.open());
     match serve(
         &mut io::stdin().lock(),
         &mut io::stdout().lock(),
@@ -580,7 +558,7 @@ mod tests {
     fn demo() -> Server {
         let mut flags = SourceFlags::new();
         flags.demo = true;
-        Server::new(flags.open(), false)
+        Server::new(flags.open())
     }
 
     fn ask(server: &mut Server, line: &str) -> Value {

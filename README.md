@@ -155,10 +155,9 @@ not proof that an agent is running or that a task succeeded.
 Any key other than Space, `h` and `?` holds the tour; Space resumes it.
 
 No model calls, network requests, database or writes to source histories are
-needed. Four things step outside that, and each happens only when its flag is
+needed. Three things step outside that, and each happens only when its flag is
 given: `--llama-metrics` makes an HTTP request, `--metrics` listens on a
-socket, `--record` writes one file, and `--verify-commits` asks git about a
-repository. Each transcript is read as an append-only log from a saved offset, so
+socket, and `--record` writes one file. Each transcript is read as an append-only log from a saved offset, so
 a poll costs only the bytes written since the last one. The collector polls
 every two seconds and discovers files every 30 seconds. It reads at most 1 MiB
 per file and 8 MiB per poll, tracks at most 256 files and keeps the newest
@@ -184,8 +183,7 @@ that coverage before treating it as a complete export; `--summary` keeps
 polling for up to three seconds until no tracked file has unread bytes. Archives and transcripts
 can describe the same work; their counts are not additive measures of completed
 tasks or token spend. Commit receipts report what the transcript recorded and
-are not checked against current git reachability unless `--verify-commits`
-is given. Excerpts are limited to 240
+are not checked against current git reachability. Excerpts are limited to 240
 characters; use the source file for the full record.
 
 ## System telemetry
@@ -287,9 +285,7 @@ set -g status-right '#(systemscape --status --tmux) %H:%M'
 `--mcp` answers questions such as who is editing a file, which files are
 contended and which sessions are stuck. Its results are data from transcripts
 and should be treated by the caller as untrusted text. `--metrics` binds to
-loopback only unless `--metrics-allow-remote` is given. `--verify-commits`, on
-`--summary` and the MCP digest, asks git whether each recorded commit still
-exists. See [insight](docs/features/insight.md).
+loopback only unless `--metrics-allow-remote` is given. See [insight](docs/features/insight.md).
 
 ## Other machines
 

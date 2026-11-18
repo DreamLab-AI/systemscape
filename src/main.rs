@@ -273,10 +273,10 @@ Usage: systemscape [--demo | --hosts FILE] [--alerts FILE] [--record] [--no-mark
        systemscape --probe [--interval SECS] [--gpu-interval SECS] [--record]
        systemscape --activity [--demo] [--alerts FILE] [--text|--json|--snapshot]
                               [--home PATH] [--workspace PATH] [--archive PATH]
-       systemscape --activity --summary [--day YYYY-MM-DD] [--json] [--verify-commits]
+       systemscape --activity --summary [--day YYYY-MM-DD] [--json]
        systemscape --activity --cast [--day YYYY-MM-DD] [--size WxH] [--length SECS]
        systemscape --status [--tmux] [--gpu] [--no-sensors]
-       systemscape --mcp [--verify-commits]
+       systemscape --mcp
        systemscape --metrics ADDR [--metrics-allow-remote] [--gpu]
 
 Telemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.
@@ -312,7 +312,6 @@ slow down while visible but unfocused.
   --status   one short line for a tmux status bar or prompt (--tmux adds colour)
   --mcp      read-only MCP server on stdio for agents
   --metrics  OpenMetrics endpoint at ADDR (loopback unless --metrics-allow-remote)
-  --verify-commits  ask git whether each recorded commit exists (opens repositories)
   --help     show this help
   --version  print version";
 

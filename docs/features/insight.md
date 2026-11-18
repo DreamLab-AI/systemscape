@@ -16,7 +16,7 @@ defaults as `--activity`.
 ## `--summary`: a day's digest
 
 ```sh
-systemscape --activity --summary [--day YYYY-MM-DD] [--json] [--verify-commits]
+systemscape --activity --summary [--day YYYY-MM-DD] [--json]
 ```
 
 `--summary` prints the coverage line, then totals for the day, then a call-out
@@ -27,9 +27,9 @@ last record times. Commits are listed under their session. The order is
 deterministic. A normal day fits on one screen: at most 6 projects, 5
 sessions per project, 5 call-outs of each kind and 4 commits per session are
 shown, and each cut list says how many it left out. `--day` defaults to the
-newest day with records. `--json` prints `{"coverage", "digest"}` (and
-`"commits"` with `--verify-commits`) with nothing cut, every string scrubbed
-of controls, directional formatting and invisible characters.
+newest day with records. `--json` prints `{"coverage", "digest"}` with
+nothing cut, every string scrubbed of controls, directional formatting and
+invisible characters.
 
 Like `--text` and `--json`, the summary is one bounded collector poll (at most
 8 MiB, newest files first), so on a large history the coverage line can
@@ -97,7 +97,7 @@ as two sessions.
 ## `--mcp`: a read-only MCP server on stdio
 
 ```sh
-systemscape --mcp [--verify-commits]
+systemscape --mcp
 ```
 
 The server speaks JSON-RPC 2.0, one message per line on stdin and stdout.
@@ -113,7 +113,7 @@ also implements `tools/list` and `tools/call`.
 | `who_is_editing` | `path` (required), `hours` (24, ≤720) | sessions with edit or write records for the file |
 | `contended_files` | `day` | files edited by more than one session |
 | `stuck_sessions` | `hours` (24, ≤168) | sessions in the window whose latest calls form a stuck run |
-| `day_digest` | `day` | the `--summary` digest; with `--verify-commits`, each commit's receipt |
+| `day_digest` | `day` | the `--summary` digest |
 | `telemetry` | `gpu` (true) | one sensor poll; GPU cards cached for ten seconds |
 
 Tool results are data. Every string is scrubbed of controls, directional
@@ -163,40 +163,10 @@ second scrape. Record counts are gauges, not counters, because the history
 is bounded and drops old records. Labels come from fixed sets, never from
 record text. With `--demo`, only the activity families are exported.
 
-## `--verify-commits`: the one exception to "never opens a repository"
-
-With `--verify-commits`, `--summary` (text and `--json`) and the MCP
-`day_digest` tool check each recorded commit:
-
-- First `git -C <project> rev-parse --git-dir`, once per project, to confirm
-  the directory is a repository.
-- Then `git -C <project> cat-file -e <sha>^{commit}`.
-
-Each receipt is marked **present**, **missing** (the repository answered and
-does not have it) or **unchecked**. Unchecked covers an invalid SHA or
-directory, not a repository, git missing, slow or refusing (for example over
-dubious ownership), or a run past the cap. git runs with an argv, never a
-shell. The SHA must be 7 to 64 hex digits and the project an existing
-absolute directory. Each call has a 2 s timeout and `core.fsmonitor=false`,
-and a run makes at most 48 git calls. `--demo` never runs git. Without the
-flag, nothing opens a repository.
-
-Two sentences elsewhere must change when this lands:
-
-- `docs/ACTIVITY.md`, line 3: "It never executes commands found in a record,
-  opens a repository, calls an API or sends history to a model." This should
-  gain: "except that `--verify-commits` asks git whether each recorded commit
-  exists".
-- `README.md`, the "Coverage" paragraph: "Commit receipts report what the
-  transcript recorded and are not checked against current git reachability."
-  This should gain: "unless `--verify-commits` is given".
-
-The README sentence "No model calls, network requests, database or writes to
-source histories are needed" stays true. `--metrics` listens only when asked,
-and `--mcp` uses stdio.
-
 ## Not claimed
 
+- Commit receipts are what the transcript recorded; they are not checked
+  against git, and SystemScape never opens a repository.
 - A stuck run means a command was logged failing repeatedly, not that the agent
   cannot recover. A failure the collector did not record is invisible.
 - Counts are of retained records (newest 5,000), not billing or task totals.
@@ -209,16 +179,15 @@ and `--mcp` uses stdio.
 Help lines to add:
 
 ```
-       systemscape --activity --summary [--day YYYY-MM-DD] [--json] [--verify-commits]
+       systemscape --activity --summary [--day YYYY-MM-DD] [--json]
        systemscape --status [--tmux] [--gpu] [--no-sensors]
-       systemscape --mcp [--verify-commits]
+       systemscape --mcp
        systemscape --metrics ADDR [--metrics-allow-remote] [--gpu]
 
   --summary  one day's digest: projects, sessions, stuck sessions, contended files
   --status   one short line for a tmux status bar or prompt (--tmux adds colour)
   --mcp      read-only MCP server on stdio for agents
   --metrics  OpenMetrics endpoint at ADDR (loopback unless --metrics-allow-remote)
-  --verify-commits  ask git whether each recorded commit exists (opens repositories)
 ```
 
 Key-table row (activity legend): `↻` marks a stuck session in the most-recent

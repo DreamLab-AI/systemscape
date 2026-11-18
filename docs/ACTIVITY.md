@@ -1,8 +1,7 @@
 # Activity inputs and limits
 
 SystemScape reads local JSONL files. It never executes commands found in a record,
-calls an API or sends history to a model. It opens a repository only when
-`--verify-commits` is given, to ask git whether a recorded commit exists.
+opens a repository, calls an API or sends history to a model.
 
 | Input | Default location |
 |-------|------------------|
