@@ -123,11 +123,23 @@ no process names, no host names.
   `systemscape` state directory for as long as it runs. A second recorder (a
   view and a probe both given `--record`, say) writes nothing and says
   `record: another systemscape is already recording here`.
-- **When.** A slot is written when the first reading of the next slot arrives.
-  The first slot after start-up began part-way through and is never written.
-  The slot open when SystemScape quits is lost. The view's sensor thread keeps
-  sampling while the view is off screen, so recording continues in a
-  background tab.
+- **When.** A slot closes when the first reading of the next slot arrives,
+  and is handed to a writer thread of its own. The read, rewrite, fsync and
+  rename all happen there, so a slow disk never delays the sensor readings
+  that feed the view and its alerts. At most 8 closed slots (20 minutes) wait
+  for a disk that has stopped answering. A slot that finds the queue full is
+  dropped, and the status line says
+  `record: the disk is not keeping up; a slot was dropped`. A failed write
+  shows on the next poll, about 2 s later.
+- **Start and end.** The first slot after start-up began part-way through and
+  is never written. The slot open when SystemScape quits is lost. A probe
+  waits on exit for its writer to finish the slots already queued. The view
+  keeps its recorder on the sensor thread, which does not run its shutdown
+  when the view quits. So a slot closed in the few milliseconds before `q`
+  may be lost too. The file is never left half written, because the rename
+  either happened or it did not.
+- **Background tabs.** The view's sensor thread keeps sampling while the view
+  is off screen, so recording continues in a background tab.
 - **Failures never stop the view.** A directory that cannot be created, a
   read-only filesystem, a missing `HOME` or a link at the final path gives a
   status-line note (`record: …`). The view carries on. A probe prints the
@@ -211,7 +223,9 @@ a dim `e heat` hint at the end of the legend row when there is room.
   - `no recorded history for 2026-11-17 (recorded 11-10 to 11-16)` for a day
     the history does not cover;
   - `cannot read the history: …` when the file cannot be read;
-  - `the history is from a newer SystemScape` when only newer lines exist.
+  - `the history is from a newer SystemScape` when only newer lines exist;
+  - `no recorded slot had closed yet at this time` when the day was recorded
+    but `now` comes before its first slot closed, as early in a replay.
 - **Reads.** Nothing is read while heat is off. While it is on and the view is
   on screen, the file is read when heat is switched on, then once a minute.
   `--activity --demo` never reads the file. It uses a synthetic history
@@ -268,6 +282,15 @@ existed at that moment.
 
 `m` and `e` were free on this tree. `--no-marks` is refused with `--probe`;
 `--record` is refused with `--demo` and `--activity`.
+
+## Cost of heat
+
+Heat colours a tower floor by floor. It works out each session's stack once
+per render: each record's height in the tower and its measure, with each
+timestamp parsed once. Each floor then reads only its own records. On a
+2,000-record tower with 14 floors, heat adds about 0.45 ms per frame in a
+release build. Walking each floor from the ground cost about 1.7 ms. The
+test `time_heat_on_a_large_tower` (ignored by default) measures it.
 
 ## Write volume
 
