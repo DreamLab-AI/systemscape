@@ -269,6 +269,7 @@ const MODES: &[(&str, Mode)] = &[
     ("--status", report::status),
     ("--mcp", mcp::run),
     ("--metrics", metrics::run),
+    ("--cast", activity::cast),
     ("--activity", activity::run),
 ];
 
