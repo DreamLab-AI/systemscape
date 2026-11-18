@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 /// A request head longer than this is refused.
 const REQUEST_LIMIT: usize = 8 * 1024;
-/// A client has this long to send its request and to take the reply.
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A client has this long to send its request and to take the reply, so a
+/// stalled client holds up the next scrape for about a second at most.
+const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 /// What one scrape reads.
@@ -285,8 +286,60 @@ fn read_head(stream: &mut TcpStream) -> Result<String, &'static str> {
     String::from_utf8(head).map_err(|_| "400 Bad Request")
 }
 
+/// Who may be served: the bound address, and whether any `Host` is accepted.
+#[derive(Clone, Copy)]
+struct Gate {
+    bound: SocketAddr,
+    remote: bool,
+}
+
+impl Gate {
+    /// Does the request's `Host` name this server? Without
+    /// `--metrics-allow-remote`, only a loopback name or the bound address
+    /// (with or without a port) is accepted, which stops a web page from
+    /// reading the endpoint through DNS rebinding.
+    fn admits(&self, head: &str) -> bool {
+        if self.remote {
+            return true;
+        }
+        let host = head.lines().skip(1).find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("host")
+                .then(|| value.trim().to_ascii_lowercase())
+        });
+        let Some(host) = host else { return false };
+        // `[v6]:port`, `[v6]`, `name:port` or `name`; a port must be digits.
+        let (name, port) = match host.strip_prefix('[') {
+            Some(rest) => match rest.split_once(']') {
+                Some((v6, tail)) => (format!("[{v6}]"), tail.strip_prefix(':')),
+                None => return false,
+            },
+            None => match host.split_once(':') {
+                Some((name, port)) => (name.to_owned(), Some(port)),
+                None => (host.clone(), None),
+            },
+        };
+        if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+            return false;
+        }
+        let bound = match self.bound.ip() {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        ["localhost", "127.0.0.1", "[::1]", bound.as_str()].contains(&name.as_str())
+    }
+}
+
 /// Pick the response for a request head: `(status, extra headers, body)`.
-fn route(head: &str, exporter: &mut Exporter) -> (&'static str, &'static str, String) {
+fn route(head: &str, gate: Gate, exporter: &mut Exporter) -> (&'static str, &'static str, String) {
+    if !head.lines().next().unwrap_or("").trim().is_empty() && !gate.admits(head) {
+        return (
+            "421 Misdirected Request",
+            "",
+            "the Host header must name this loopback endpoint\n".into(),
+        );
+    }
     let mut parts = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let path = target.split('?').next().unwrap_or("");
@@ -298,10 +351,10 @@ fn route(head: &str, exporter: &mut Exporter) -> (&'static str, &'static str, St
     }
 }
 
-fn answer(stream: &mut TcpStream, exporter: &mut Exporter) -> io::Result<()> {
+fn answer(stream: &mut TcpStream, gate: Gate, exporter: &mut Exporter) -> io::Result<()> {
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let (status, content_type, body) = match read_head(stream) {
-        Ok(head) => route(&head, exporter),
+        Ok(head) => route(&head, gate, exporter),
         Err(status) => (status, "", format!("{status}\n")),
     };
     let content_type = if content_type.is_empty() {
@@ -323,11 +376,20 @@ fn answer(stream: &mut TcpStream, exporter: &mut Exporter) -> io::Result<()> {
 }
 
 /// Answer connections one at a time; `limit` stops after that many (for tests).
-fn serve(listener: &TcpListener, exporter: &mut Exporter, limit: Option<usize>) -> io::Result<()> {
+fn serve(
+    listener: &TcpListener,
+    remote: bool,
+    exporter: &mut Exporter,
+    limit: Option<usize>,
+) -> io::Result<()> {
+    let gate = Gate {
+        bound: listener.local_addr()?,
+        remote,
+    };
     for (served, stream) in listener.incoming().enumerate() {
         // A client that misbehaves only costs its own connection.
         if let Ok(mut stream) = stream {
-            let _ = answer(&mut stream, exporter);
+            let _ = answer(&mut stream, gate, exporter);
         }
         if limit.is_some_and(|limit| served + 1 >= limit) {
             break;
@@ -368,7 +430,12 @@ pub fn run(args: &[String]) -> io::Result<()> {
         "systemscape: serving OpenMetrics on http://{}/metrics until interrupted",
         listener.local_addr()?
     );
-    serve(&listener, &mut Exporter::new(sources.open(), gpu), None)
+    serve(
+        &listener,
+        remote,
+        &mut Exporter::new(sources.open(), gpu),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -384,9 +451,13 @@ mod tests {
 
     /// Send raw bytes to a one-connection server on a free loopback port.
     fn exchange(request: &[u8]) -> String {
+        exchange_as(request, false)
+    }
+
+    fn exchange_as(request: &[u8], remote: bool) -> String {
         let listener = bind("127.0.0.1:0", false).unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || serve(&listener, &mut demo(), Some(1)));
+        let server = std::thread::spawn(move || serve(&listener, remote, &mut demo(), Some(1)));
         let mut client = TcpStream::connect(addr).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -419,15 +490,88 @@ mod tests {
 
     #[test]
     fn other_paths_methods_and_oversized_requests_are_refused() {
-        assert!(exchange(b"GET / HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
-        assert!(exchange(b"GET /metrics/../etc HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
-        let post = exchange(b"POST /metrics HTTP/1.1\r\n\r\n");
+        assert!(exchange(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").starts_with("HTTP/1.1 404"));
+        assert!(
+            exchange(b"GET /metrics/../etc HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .starts_with("HTTP/1.1 404")
+        );
+        let post = exchange(b"POST /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(post.starts_with("HTTP/1.1 405") && post.contains("Allow: GET"));
         assert!(exchange(b"\r\n\r\n").starts_with("HTTP/1.1 400"));
         let mut huge = b"GET /metrics HTTP/1.1\r\nX: ".to_vec();
         huge.extend(std::iter::repeat_n(b'a', REQUEST_LIMIT * 2));
         assert!(exchange(&huge).starts_with("HTTP/1.1 431"));
-        assert!(exchange(b"GET /metrics?x=1 HTTP/1.0\n\n").starts_with("HTTP/1.1 200"));
+        assert!(
+            exchange(b"GET /metrics?x=1 HTTP/1.0\nhost: LOCALHOST:9464\n\n")
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+
+    #[test]
+    fn only_loopback_host_names_are_served_unless_remote_is_allowed() {
+        let get = |host: &str| format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        for host in [
+            "localhost",
+            "127.0.0.1:9464",
+            "[::1]",
+            "[::1]:80",
+            "LocalHost",
+        ] {
+            assert!(
+                exchange(get(host).as_bytes()).starts_with("HTTP/1.1 200"),
+                "{host}"
+            );
+        }
+        for host in [
+            "evil.example",
+            "evil.example:9464",
+            "localhost.evil.example",
+            "localhost:",
+            "localhost:x",
+            "[::1",
+        ] {
+            assert!(
+                exchange(get(host).as_bytes()).starts_with("HTTP/1.1 421"),
+                "{host}"
+            );
+        }
+        let no_host = exchange(b"GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            no_host.starts_with("HTTP/1.1 421"),
+            "a missing Host is refused"
+        );
+        assert!(exchange_as(get("evil.example").as_bytes(), true).starts_with("HTTP/1.1 200"));
+        let bound = Gate {
+            bound: "192.0.2.7:9464".parse().unwrap(),
+            remote: false,
+        };
+        assert!(bound.admits("GET / HTTP/1.1\r\nHost: 192.0.2.7:9464\r\n"));
+        assert!(!bound.admits("GET / HTTP/1.1\r\nHost: 192.0.2.8\r\n"));
+    }
+
+    #[test]
+    fn a_silent_client_holds_the_next_scrape_for_about_a_second() {
+        let listener = bind("127.0.0.1:0", false).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve(&listener, false, &mut demo(), Some(2)));
+        let started = Instant::now();
+        let mut silent = TcpStream::connect(addr).unwrap();
+        let mut scraper = TcpStream::connect(addr).unwrap();
+        scraper
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        scraper
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reply = String::new();
+        let _ = scraper.read_to_string(&mut reply);
+        let waited = started.elapsed();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(waited < Duration::from_millis(2500), "{waited:?}");
+        let mut refused = String::new();
+        let _ = silent.read_to_string(&mut refused);
+        assert!(refused.starts_with("HTTP/1.1 408"), "{refused}");
+        server.join().unwrap().unwrap();
     }
 
     #[test]

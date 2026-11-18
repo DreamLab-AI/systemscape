@@ -31,6 +31,11 @@ newest day with records. `--json` prints `{"coverage", "digest"}` with
 nothing cut, every string scrubbed of controls, directional formatting and
 invisible characters.
 
+**`--json` output contains record text and whole file paths.** It strips
+terminal controls and directional formatting, but it does not redact
+credentials typed into prompts or commands. Prompts and commands can hold
+sensitive text. Use `--demo` for anything you share.
+
 Like `--text` and `--json`, the summary is one bounded collector poll (at most
 8 MiB, newest files first), so on a large history the coverage line can
 report files still pending. Check it before treating the digest as complete.
@@ -109,12 +114,24 @@ also implements `tools/list` and `tools/call`.
 
 | Tool | Arguments | Answer |
 |------|-----------|--------|
-| `recent_sessions` | `hours` (24, ≤168), `limit` (20, ≤50) | sessions with a record in the window, newest first, with state and newest record |
+| `recent_sessions` | `hours` (24, ≤168), `limit` (20, ≤50), `include_text` (false) | sessions with a record in the window, newest first, with state and the newest record's kind and time |
 | `who_is_editing` | `path` (required), `hours` (24, ≤720) | sessions with edit or write records for the file |
 | `contended_files` | `day` | files edited by more than one session |
-| `stuck_sessions` | `hours` (24, ≤168) | sessions in the window whose latest calls form a stuck run |
-| `day_digest` | `day` | the `--summary` digest |
+| `stuck_sessions` | `hours` (24, ≤168), `include_text` (false) | sessions in the window whose latest calls form a stuck run |
+| `day_digest` | `day`, `include_text` (false) | the `--summary` digest |
 | `telemetry` | `gpu` (true) | one sensor poll; GPU cards cached for ten seconds |
+
+Record text is opt-in. By default, results carry counts, kinds, times,
+session and project names and file paths. A session's latest record text
+(`latest`) and a stuck session's repeated command (`command`) are returned
+only when the call passes `"include_text": true`. That text is untrusted
+transcript content: a calling agent should treat it as data, never as
+instructions. The tool descriptions and the server instructions say so, and
+every result names which mode it used in `text_fields`.
+
+**MCP output contains whole file paths and, with `include_text`, record
+text.** Neither is redacted: prompts and commands can hold sensitive text,
+such as credentials typed into them. Use `--demo` for anything you share.
 
 Tool results are data. Every string is scrubbed of controls, directional
 formatting and invisible characters and cut to 1,024 characters. Lists stop at
@@ -139,10 +156,20 @@ systemscape --metrics 127.0.0.1:9464 [--metrics-allow-remote] [--gpu]
 
 The endpoint serves `GET /metrics` as `application/openmetrics-text`.
 Anything else gets 404, 405, 400, 408 or 431. Connections are handled one at
-a time, with an 8 KiB request limit and a 5 s limit to send the request and
-take the reply. The endpoint binds loopback only. Any address that is not
-loopback, including `0.0.0.0` and `[::]`, is refused unless
-`--metrics-allow-remote` is also given. It runs headless until interrupted
+a time, with an 8 KiB request limit and a 1 s limit to send the request and
+take the reply, so a client that connects and sends nothing holds up the next
+scrape for about a second. The endpoint binds loopback only. Any address that
+is not loopback, including `0.0.0.0` and `[::]`, is refused unless
+`--metrics-allow-remote` is also given. Requests must also carry a `Host`
+header naming `localhost`, `127.0.0.1`, `[::1]` or the bound address, with or
+without a port. Any other `Host`, or none, gets 421. This stops a web page
+from reading the endpoint through DNS rebinding.
+
+**`--metrics-allow-remote` exposes the endpoint without authentication** to
+anything that can reach the port, and accepts any `Host`. Each request costs
+a collector poll and a sensor poll, so anyone who can reach it can make the
+machine do that work as often as they like. Put a firewall or an
+authenticating proxy in front of it. It runs headless until interrupted
 and does its work per scrape: one bounded collector poll and one sensor poll.
 nvidia-smi runs only with `--gpu`, at most every ten seconds.
 

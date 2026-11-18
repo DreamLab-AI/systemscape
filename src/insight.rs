@@ -438,7 +438,9 @@ pub(crate) struct Recent {
     pub(crate) state: State,
     pub(crate) records: usize,
     pub(crate) last: String,
-    /// The newest record's kind and text.
+    /// The newest record's kind.
+    pub(crate) latest_kind: String,
+    /// The newest record's text: transcript content, untrusted.
     pub(crate) latest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stuck: Option<Run>,
@@ -473,7 +475,8 @@ pub(crate) fn recent(events: &[Event], now: DateTime<Utc>, since: DateTime<Utc>)
                 state,
                 records: records.len(),
                 last: newest.at.clone(),
-                latest: format!("{} {}", newest.kind, newest.text),
+                latest_kind: newest.kind.clone(),
+                latest: newest.text.clone(),
                 stuck,
             }
         })
