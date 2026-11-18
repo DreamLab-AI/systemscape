@@ -133,6 +133,29 @@ impl Sources {
         self.collector.is_none()
     }
 
+    /// Poll until no tracked file has unread bytes, for at most `budget`:
+    /// a report of a whole day should not stop at the first poll's byte
+    /// limit. Each poll is still bounded, and a round that reads nothing
+    /// new ends the wait, so files that can never drain do not hold it open.
+    pub(crate) fn load_drained(&mut self, budget: Duration) -> (Vec<Event>, String) {
+        let started = std::time::Instant::now();
+        let mut loaded = self.load();
+        let Some(collector) = &mut self.collector else {
+            return loaded;
+        };
+        let mut pending = collector.pending();
+        while pending > 0 && started.elapsed() < budget {
+            collector.poll();
+            let left = collector.pending();
+            if left >= pending {
+                break;
+            }
+            pending = left;
+        }
+        loaded = (collector.rows(), collector.coverage());
+        loaded
+    }
+
     /// One bounded poll; the records (newest first) and the coverage line.
     pub(crate) fn load(&mut self) -> (Vec<Event>, String) {
         match &mut self.collector {
@@ -549,7 +572,7 @@ pub fn summary(args: &[String]) -> io::Result<()> {
         }
     }
     let mut sources = sources.open();
-    let (events, coverage) = sources.load();
+    let (events, coverage) = sources.load_drained(Duration::from_secs(3));
     let day = day
         .or_else(|| insight::days(&events).first().map(|d| (*d).to_owned()))
         .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());

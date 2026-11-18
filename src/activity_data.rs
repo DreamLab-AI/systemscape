@@ -708,13 +708,16 @@ impl Collector {
         rows.sort_by(|a, b| b.at.cmp(&a.at).then(a.key.cmp(&b.key)));
         rows
     }
-    pub fn coverage(&self) -> String {
-        let families: BTreeSet<_> = self.files.iter().map(|s| s.family).collect();
-        let pending = self
-            .files
+    /// Tracked files with bytes not yet read.
+    pub fn pending(&self) -> usize {
+        self.files
             .iter()
             .filter(|source| self.states.get(&source.path).is_none_or(|s| s.pending))
-            .count();
+            .count()
+    }
+    pub fn coverage(&self) -> String {
+        let families: BTreeSet<_> = self.files.iter().map(|s| s.family).collect();
+        let pending = self.pending();
         format!(
             "Sources: {} | {} files | {} records | {} files pending | {} files omitted | {} read/parse errors{}",
             if families.is_empty() {
