@@ -11,7 +11,7 @@ use crate::telemetry::quad;
 use crate::{
     ColChar, Colour, DisplayMode, Face, Mesh3D, Modifier, Transform3D, Vec2D, Vec3D, Viewport,
 };
-use crossterm::event::{self, Event as Input, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event as Input, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -1319,6 +1319,82 @@ fn unix_now() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0
 }
 
+/// What a key press asks of the run loop.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Quit,
+    Redraw,
+    /// The key means nothing here: nothing changed.
+    Ignore,
+}
+
+/// Apply one key press to the view state. `in_list` is whether the detail
+/// view is on screen, where `j`/`k` and Enter act on records.
+fn handle_key(state: &mut State, key: KeyEvent, events: &[Event], in_list: bool) -> Action {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::Quit;
+    }
+    if !matches!(
+        key.code,
+        KeyCode::Char(' ' | '?' | 'h' | 'q') | KeyCode::Esc
+    ) {
+        state.tour = false;
+    }
+    let city = city(events, state);
+    // In the city, only drawn towers can be selected.
+    let count = if in_list {
+        city.sessions.len()
+    } else {
+        city.sessions.len().min(MAX_TOWERS)
+    };
+    let step = |state: &mut State, forward: bool| {
+        if count > 0 {
+            let current = state.selected.min(count - 1);
+            let next = if forward {
+                (current + 1) % count
+            } else {
+                (current + count - 1) % count
+            };
+            select(state, &city, next);
+        }
+    };
+    let session = city.sessions.get(state.selected);
+    let records = |state: &mut State, delta: isize| {
+        if let Some(session) = session {
+            step_record(state, session, delta);
+        }
+    };
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
+        KeyCode::Char(' ') => {
+            state.tour = !state.tour;
+            state.dwell = 0.0;
+        }
+        KeyCode::Left => state.yaw = (state.yaw - 0.08).max(-1.1),
+        KeyCode::Right => state.yaw = (state.yaw + 0.08).min(1.1),
+        KeyCode::Up => state.lift = (state.lift + 2.0).min(60.0),
+        KeyCode::Down => state.lift = (state.lift - 2.0).max(-12.0),
+        KeyCode::Char('+') | KeyCode::Char('=') => state.dolly = (state.dolly * 0.9).max(0.4),
+        KeyCode::Char('-') => state.dolly = (state.dolly * 1.1).min(3.0),
+        KeyCode::Char('0') => (state.yaw, state.lift, state.dolly) = (0.0, 0.0, 1.0),
+        KeyCode::Char('j') if in_list => records(state, 1),
+        KeyCode::Char('k') if in_list => records(state, -1),
+        KeyCode::PageDown => records(state, 10),
+        KeyCode::PageUp => records(state, -10),
+        KeyCode::Char('j') | KeyCode::Tab => step(state, true),
+        KeyCode::Char('k') | KeyCode::BackTab => step(state, false),
+        KeyCode::Char('[') => step_day(state, &city, 1),
+        KeyCode::Char(']') => step_day(state, &city, -1),
+        KeyCode::Char('f') => state.flat = !state.flat,
+        KeyCode::Enter if in_list => state.detail = !state.detail,
+        KeyCode::Enter => state.flat = true,
+        KeyCode::Char('h') => state.strip = !state.strip,
+        KeyCode::Char('?') => state.coverage = !state.coverage,
+        _ => return Action::Ignore,
+    }
+    Action::Redraw
+}
+
 pub fn run(args: &[String]) -> io::Result<()> {
     let mut home_override = false;
     let mut home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
@@ -1492,69 +1568,10 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 sight.focus(false);
             }
             Input::Key(key) if key.kind != KeyEventKind::Release => {
-                dirty = true;
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return Ok(());
-                }
-                if !matches!(
-                    key.code,
-                    KeyCode::Char(' ' | '?' | 'h' | 'q') | KeyCode::Esc
-                ) {
-                    state.tour = false;
-                }
-                let city = city(&events, &mut state);
-                // In the city, only drawn towers can be selected.
-                let count = if in_list {
-                    city.sessions.len()
-                } else {
-                    city.sessions.len().min(MAX_TOWERS)
-                };
-                let step = |state: &mut State, forward: bool| {
-                    if count > 0 {
-                        let current = state.selected.min(count - 1);
-                        let next = if forward {
-                            (current + 1) % count
-                        } else {
-                            (current + count - 1) % count
-                        };
-                        select(state, &city, next);
-                    }
-                };
-                let session = city.sessions.get(state.selected);
-                let records = |state: &mut State, delta: isize| {
-                    if let Some(session) = session {
-                        step_record(state, session, delta);
-                    }
-                };
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char(' ') => {
-                        state.tour = !state.tour;
-                        state.dwell = 0.0;
-                    }
-                    KeyCode::Left => state.yaw = (state.yaw - 0.08).max(-1.1),
-                    KeyCode::Right => state.yaw = (state.yaw + 0.08).min(1.1),
-                    KeyCode::Up => state.lift = (state.lift + 2.0).min(60.0),
-                    KeyCode::Down => state.lift = (state.lift - 2.0).max(-12.0),
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        state.dolly = (state.dolly * 0.9).max(0.4)
-                    }
-                    KeyCode::Char('-') => state.dolly = (state.dolly * 1.1).min(3.0),
-                    KeyCode::Char('0') => (state.yaw, state.lift, state.dolly) = (0.0, 0.0, 1.0),
-                    KeyCode::Char('j') if in_list => records(&mut state, 1),
-                    KeyCode::Char('k') if in_list => records(&mut state, -1),
-                    KeyCode::PageDown => records(&mut state, 10),
-                    KeyCode::PageUp => records(&mut state, -10),
-                    KeyCode::Char('j') | KeyCode::Tab => step(&mut state, true),
-                    KeyCode::Char('k') | KeyCode::BackTab => step(&mut state, false),
-                    KeyCode::Char('[') => step_day(&mut state, &city, 1),
-                    KeyCode::Char(']') => step_day(&mut state, &city, -1),
-                    KeyCode::Char('f') => state.flat = !state.flat,
-                    KeyCode::Enter if in_list => state.detail = !state.detail,
-                    KeyCode::Enter => state.flat = true,
-                    KeyCode::Char('h') => state.strip = !state.strip,
-                    KeyCode::Char('?') => state.coverage = !state.coverage,
-                    _ => dirty = false,
+                match handle_key(&mut state, key, &events, in_list) {
+                    Action::Quit => return Ok(()),
+                    Action::Redraw => dirty = true,
+                    Action::Ignore => (),
                 }
             }
             _ => (),
@@ -1594,6 +1611,8 @@ mod tests {
             kind: kind.into(),
             text: text.into(),
             source: "fixture".into(),
+            parent: None,
+            path: None,
         }
     }
 

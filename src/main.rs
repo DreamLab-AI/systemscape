@@ -240,6 +240,12 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
     Ok(TelemetryMode::View { demo, hosts })
 }
 
+/// Modes other than telemetry: the first flag present on the command line
+/// picks the mode, which then parses the whole command line itself. A new
+/// mode is one line here.
+type Mode = fn(&[String]) -> std::io::Result<()>;
+const MODES: &[(&str, Mode)] = &[("--activity", activity::run)];
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -250,8 +256,11 @@ fn main() {
         println!("systemscape {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    if args.iter().any(|a| a == "--activity") {
-        if let Err(error) = activity::run(&args) {
+    if let Some((_, run)) = MODES
+        .iter()
+        .find(|(flag, _)| args.iter().any(|a| a == flag))
+    {
+        if let Err(error) = run(&args) {
             eprintln!("systemscape: {error}");
             std::process::exit(1);
         }

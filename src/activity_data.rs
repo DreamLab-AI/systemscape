@@ -26,6 +26,44 @@ pub struct Event {
     pub kind: String,
     pub text: String,
     pub source: String,
+    /// The session that delegated this one, for a subagent's records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The file a tool call was given, whole: `text` is cut to 240 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A file path as recorded, without controls, capped at 1,024 characters.
+fn clean_path(s: &str) -> Option<String> {
+    let path: String = s
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(1024)
+        .collect();
+    (!path.is_empty()).then_some(path)
+}
+
+/// The file a tool call names, when it names one.
+fn tool_path(input: &Value) -> Option<String> {
+    ["file_path", "notebook_path", "path"]
+        .iter()
+        .find_map(|key| input[*key].as_str())
+        .and_then(clean_path)
+}
+
+/// The file a Codex call names: a patch's `File:` line or a path argument.
+fn codex_path(payload: &Value) -> Option<String> {
+    if let Some(code) = payload["input"].as_str() {
+        return code
+            .split_once("File: ")
+            .and_then(|(_, rest)| clean_path(rest.lines().next().unwrap_or("")));
+    }
+    payload["arguments"]
+        .as_str()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|arguments| tool_path(&arguments))
 }
 
 /// Strip terminal controls, directional formatting and invisible text carriers.
@@ -236,6 +274,17 @@ fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
     );
     let id = fallback(string(&row["uuid"]), &digest(&row.to_string())).to_owned();
     let mut found: Vec<(String, &str, String)> = vec![];
+    // File paths of tool calls, by the key of the record that names them.
+    let mut paths: HashMap<String, String> = HashMap::new();
+    // A Claude subagent's transcript carries its parent's session ID, so the
+    // child is told apart by its agent ID and keeps the parent as a link.
+    let mut parent = None;
+    if source.family == "claude" && row["isSidechain"] == true {
+        if let Some(child) = row["agentId"].as_str().filter(|id| !id.is_empty()) {
+            parent = Some(clean(&session));
+            session = format!("{session}/{child}");
+        }
+    }
     match source.family {
         "archive" => {
             let meta = &row["metadata"];
@@ -302,6 +351,9 @@ fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
             for (i, b) in blocks.iter().enumerate() {
                 if b["type"] == "tool_use" {
                     let key = fallback(string(&b["id"]), &format!("{id}:{i}")).to_owned();
+                    if let Some(path) = tool_path(&b["input"]) {
+                        paths.insert(key.clone(), path);
+                    }
                     found.push((
                         key,
                         "tool",
@@ -346,11 +398,13 @@ fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
                     },
                     format!("Recorded {}", kind.replace('_', " ")),
                 )),
-            ("response_item", "function_call" | "custom_tool_call") => found.push((
-                fallback(string(&payload["call_id"]), &id).to_owned(),
-                "tool",
-                codex_call(payload),
-            )),
+            ("response_item", "function_call" | "custom_tool_call") => {
+                let key = fallback(string(&payload["call_id"]), &id).to_owned();
+                if let Some(path) = codex_path(payload) {
+                    paths.insert(key.clone(), path);
+                }
+                found.push((key, "tool", codex_call(payload)));
+            }
             _ => {}
         },
         _ => {}
@@ -358,6 +412,8 @@ fn normalise(row: &Value, source: &Source, ctx: &mut Context) -> Vec<Event> {
     found
         .into_iter()
         .map(|(key, kind, text)| Event {
+            path: paths.remove(&key),
+            parent: parent.clone(),
             key: format!("{}:{}:{}:{}", source.family, source.profile, session, key),
             at: at.clone(),
             agent: clean(&agent),
@@ -683,6 +739,9 @@ impl Collector {
 /// an error, and three idle, each a run of prompts followed by tool calls.
 pub fn demo_events() -> Vec<Event> {
     // (agent, session, project, minutes since its last record, turns, ending)
+    // A session named `parent/child` is a subagent of `parent`. The last two
+    // sessions are a day old, and the session ending in a failure repeats one
+    // failing command, so every derived view has something to show.
     let sessions = [
         (
             "codex",
@@ -740,6 +799,30 @@ pub fn demo_events() -> Vec<Event> {
             3,
             "receipt",
         ),
+        (
+            "claude",
+            "93bc1f6c-demo/7d1e0c55",
+            "/workspace/systemscape",
+            0,
+            2,
+            "tool",
+        ),
+        (
+            "claude",
+            "e41b77d0-demo",
+            "/workspace/systemscape",
+            1570,
+            5,
+            "receipt",
+        ),
+        (
+            "codex",
+            "c8a2f3b9-demo",
+            "/workspace/VisionFlow",
+            1640,
+            4,
+            "event",
+        ),
     ];
     let prompts = [
         "Inspect agent activity history",
@@ -780,13 +863,24 @@ pub fn demo_events() -> Vec<Event> {
                 session: (*session).into(),
                 project: (*project).into(),
                 kind: kind.into(),
+                parent: session.split_once('/').map(|(parent, _)| parent.into()),
+                path: ["Read ", "Edit ", "Write ", "apply_patch "]
+                    .iter()
+                    .find_map(|tool| text.strip_prefix(tool))
+                    .map(|file| format!("{project}/{file}")),
                 text,
                 source: "synthetic demo".into(),
             });
             *back += chrono::Duration::seconds(17 + (events.len() as i64 * 7) % 40);
         };
         match *ending {
-            "failure" => push("failure", "Recorded turn aborted".into(), &mut back),
+            "failure" => {
+                push("failure", "Recorded turn aborted".into(), &mut back);
+                for _ in 0..3 {
+                    push("failure", "Tool reported an error".into(), &mut back);
+                    push("tool", "Bash cargo test --locked".into(), &mut back);
+                }
+            }
             "receipt" => push(
                 "receipt",
                 format!("Recorded commit {s}c0ffee (demo)"),
@@ -1002,6 +1096,55 @@ mod tests {
         let mut c = f.collector();
         c.poll();
         assert_eq!(c.rows().len(), 1);
+    }
+    #[test]
+    fn a_subagent_is_its_own_session_linked_to_its_parent_and_tools_keep_whole_paths() {
+        let f = Fixture::new();
+        let long = format!("/work/{}/main.rs", "deep/".repeat(60));
+        let row = serde_json::json!({
+            "type": "assistant", "sessionId": "parent-1", "agentId": "kid", "isSidechain": true,
+            "uuid": "u1", "timestamp": "2026-01-02T03:04:05Z", "cwd": "/work",
+            "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Edit",
+                "input": {"file_path": long}}]}
+        });
+        f.file(
+            ".claude/projects/p/parent-1/subagents/agent-kid.jsonl",
+            &format!("{row}\n"),
+        );
+        let mut c = f.collector();
+        c.poll();
+        let rows = c.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session, "parent-1/kid");
+        assert_eq!(rows[0].parent.as_deref(), Some("parent-1"));
+        assert_eq!(
+            rows[0].path.as_deref(),
+            Some(long.as_str()),
+            "not cut to 240"
+        );
+        assert!(rows[0].text.chars().count() <= 240);
+    }
+    #[test]
+    fn the_demo_has_a_subagent_a_contended_file_an_earlier_day_and_a_repeated_failure() {
+        let events = demo_events();
+        assert!(events
+            .iter()
+            .any(|e| e.parent.as_deref() == Some("93bc1f6c-demo")));
+        let days: BTreeSet<&str> = events.iter().filter_map(|e| e.at.get(..10)).collect();
+        assert!(days.len() >= 2);
+        let mut editors: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for e in events.iter().filter(|e| e.text.starts_with("Edit ")) {
+            editors
+                .entry(e.path.as_deref().unwrap())
+                .or_default()
+                .insert(&e.session);
+        }
+        assert!(editors.values().any(|sessions| sessions.len() > 1));
+        let repeats = events
+            .iter()
+            .filter(|e| e.session == "77e385bc-demo" && e.text == "Bash cargo test --locked")
+            .count();
+        assert!(repeats >= 3);
     }
     #[test]
     fn controls_and_tool_results_are_not_prompts() {
