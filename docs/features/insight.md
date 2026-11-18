@@ -139,8 +139,10 @@ formatting and invisible characters and cut to 1,024 characters. Lists stop at
 refused. Request lines are limited to 1 MiB. Nothing a record contains is
 ever run. An unknown tool is a protocol error (-32602). A bad argument value
 is a result with `isError`, so the calling model can read it and fix the
-call. The collector is kept between calls, so each call reads only what was
-appended since the last one. With `--demo`, the records are synthetic and
+call. The first call keeps polling for up to three seconds, until every
+tracked file is read, so its answer covers the whole retained history. The
+collector is kept between calls, so each later call is one bounded poll that
+reads only what was appended since the last one. With `--demo`, the records are synthetic and
 `telemetry` answers with an error rather than read the machine. A client
 configuration looks like this:
 
@@ -171,6 +173,9 @@ a collector poll and a sensor poll, so anyone who can reach it can make the
 machine do that work as often as they like. Put a firewall or an
 authenticating proxy in front of it. It runs headless until interrupted
 and does its work per scrape: one bounded collector poll and one sensor poll.
+The first scrape keeps polling for up to three seconds, until every tracked
+file is read, so its record counts cover the whole retained history rather
+than one poll's share.
 nvidia-smi runs only with `--gpu`, at most every ten seconds.
 
 The families are all gauges:

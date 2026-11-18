@@ -20,9 +20,15 @@ const REQUEST_LIMIT: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
+/// The first scrape keeps polling for up to this long, so it covers the
+/// whole retained history rather than one bounded poll's share.
+const FIRST_READ: Duration = Duration::from_secs(3);
+
 /// What one scrape reads.
 pub(crate) struct Exporter {
     sources: Sources,
+    /// Whether the history has been read to the end once.
+    drained: bool,
     sensors: Sensors,
     gpu: bool,
 }
@@ -210,13 +216,19 @@ impl Exporter {
             sources,
             sensors: Sensors::default(),
             gpu,
+            drained: false,
         }
     }
 
     /// One scrape's body. The demo has no telemetry, only activity.
     pub(crate) fn scrape(&mut self) -> String {
         let reading = (!self.sources.demo()).then(|| self.sensors.read(self.gpu));
-        let (events, _) = self.sources.load();
+        // Drain on the first scrape; afterwards one bounded poll reads what was appended.
+        let (events, _) = if std::mem::replace(&mut self.drained, true) {
+            self.sources.load()
+        } else {
+            self.sources.load_drained(FIRST_READ)
+        };
         let now = chrono::Utc::now();
         let today = now.format("%Y-%m-%d").to_string();
         let found = insight::kinds(&events, &today);
@@ -572,6 +584,19 @@ mod tests {
         let _ = silent.read_to_string(&mut refused);
         assert!(refused.starts_with("HTTP/1.1 408"), "{refused}");
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn the_first_scrape_reads_the_whole_history() {
+        let (dir, sources) = crate::mcp::tests::large_history(12);
+        let mut exporter = Exporter::new(sources, false);
+        let body = exporter.scrape();
+        assert!(
+            body.contains("systemscape_activity_records{kind=\"prompt\"} 12\n"),
+            "{body}"
+        );
+        assert!(exporter.scrape().contains("{kind=\"prompt\"} 12\n"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

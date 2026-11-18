@@ -15,6 +15,7 @@ use crate::report::{
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 /// The newest protocol first; the last three use the `initialize` handshake.
 const SUPPORTED: [&str; 4] = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
@@ -240,9 +241,15 @@ fn capped<T: serde::Serialize>(items: &[T], limit: usize) -> (Value, usize) {
     (json!(shown), items.len() - shown.len())
 }
 
+/// The first call keeps polling for up to this long, so its answer covers
+/// the whole retained history rather than one bounded poll's share.
+const FIRST_READ: Duration = Duration::from_secs(3);
+
 /// The MCP request handler; one per connection.
 pub(crate) struct Server {
     sources: Sources,
+    /// Whether the history has been read to the end once.
+    drained: bool,
     sensors: Sensors,
 }
 
@@ -251,6 +258,17 @@ impl Server {
         Self {
             sources,
             sensors: Sensors::default(),
+            drained: false,
+        }
+    }
+
+    /// The records and coverage line: drained on the first call, then one
+    /// bounded poll that reads what was appended since.
+    fn load(&mut self) -> (Vec<crate::activity_data::Event>, String) {
+        if std::mem::replace(&mut self.drained, true) {
+            self.sources.load()
+        } else {
+            self.sources.load_drained(FIRST_READ)
         }
     }
 
@@ -407,7 +425,7 @@ impl Server {
         let since = now - args.hours(24.0, 168.0)?;
         let limit = args.limit()?;
         let text = args.include_text()?;
-        let (events, coverage) = self.sources.load();
+        let (events, coverage) = self.load();
         let (sessions, more) = capped(&insight::recent(&events, now, since), limit);
         Ok(text_gate(
             json!({"since": insight::stamp(since), "sessions": sessions, "more": more,
@@ -420,7 +438,7 @@ impl Server {
         args.only(&["path", "hours"])?;
         let path = args.path()?;
         let since = now - args.hours(24.0, 720.0)?;
-        let (events, coverage) = self.sources.load();
+        let (events, coverage) = self.load();
         let (editors, more) = capped(&insight::editors(&events, &path, since, now), LIST_LIMIT);
         Ok(
             json!({"path": path, "since": insight::stamp(since), "editors": editors,
@@ -430,7 +448,7 @@ impl Server {
 
     fn contended_files(&mut self, args: &Args) -> Result<Value, String> {
         args.only(&["day"])?;
-        let (events, coverage) = self.sources.load();
+        let (events, coverage) = self.load();
         let day = pick_day(args.day()?, &events);
         let (files, more) = capped(&insight::contended(&events, &day), LIST_LIMIT);
         Ok(json!({"day": day, "files": files, "more": more, "coverage": coverage}))
@@ -440,7 +458,7 @@ impl Server {
         args.only(&["hours", "include_text"])?;
         let since = now - args.hours(24.0, 168.0)?;
         let text = args.include_text()?;
-        let (events, coverage) = self.sources.load();
+        let (events, coverage) = self.load();
         let stuck: Vec<_> = insight::recent(&events, now, since)
             .into_iter()
             .filter(|s| s.stuck.is_some())
@@ -456,7 +474,7 @@ impl Server {
     fn day_digest(&mut self, args: &Args) -> Result<Value, String> {
         args.only(&["day", "include_text"])?;
         let text = args.include_text()?;
-        let (events, coverage) = self.sources.load();
+        let (events, coverage) = self.load();
         let day = pick_day(args.day()?, &events);
         let mut digest = insight::digest(&events, &day);
         let projects = digest.projects.len();
@@ -604,13 +622,75 @@ pub fn run(args: &[String]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn demo() -> Server {
         let mut flags = SourceFlags::new();
         flags.demo = true;
         Server::new(flags.open())
+    }
+
+    /// A history too large for one bounded poll: `files` Claude transcripts
+    /// of about 1.1 MiB, each ending in one prompt from today in its own
+    /// session. Returns the directory (to remove) and its sources.
+    pub(crate) fn large_history(files: usize) -> (std::path::PathBuf, Sources) {
+        static ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "systemscape-drain-{}-{}",
+            std::process::id(),
+            ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let projects = dir.join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        let filler = json!({"ignored": "x".repeat(1100)}).to_string() + "\n";
+        let at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        for i in 0..files {
+            let prompt = json!({"timestamp": at.to_string(), "type": "user", "uuid": format!("u{i}"),
+                                "sessionId": format!("s{i}"), "message": {"content": "hello"}});
+            std::fs::write(
+                projects.join(format!("{i}.jsonl")),
+                filler.repeat(1000) + &prompt.to_string() + "\n",
+            )
+            .unwrap();
+        }
+        let argv: Vec<String> = ["--home", "--workspace", "--archive"]
+            .iter()
+            .zip(["", "", "archive"])
+            .flat_map(|(flag, sub)| {
+                [
+                    flag.to_string(),
+                    dir.join(sub).to_string_lossy().into_owned(),
+                ]
+            })
+            .collect();
+        let mut flags = SourceFlags::new();
+        let mut rest = argv.iter();
+        while let Some(arg) = rest.next() {
+            assert!(flags.take(arg, &mut rest).unwrap());
+        }
+        (dir, flags.open())
+    }
+
+    #[test]
+    fn the_first_call_reads_the_whole_history_and_later_calls_poll_once() {
+        // One bounded poll does not reach every file.
+        let (dir, mut single) = large_history(12);
+        assert!(
+            single.load().0.len() < 12,
+            "the fixture must exceed one poll"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (dir, sources) = large_history(12);
+        let mut server = Server::new(sources);
+        let reply = call(&mut server, 1, "day_digest", json!({}));
+        let digest = &reply["result"]["structuredContent"]["digest"];
+        assert_eq!(digest["counts"]["prompts"], 12, "{digest}");
+        let again = call(&mut server, 2, "recent_sessions", json!({"limit": 50}));
+        let sessions = &again["result"]["structuredContent"]["sessions"];
+        assert_eq!(sessions.as_array().unwrap().len(), 12);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn ask(server: &mut Server, line: &str) -> Value {
