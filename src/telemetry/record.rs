@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 /// Version of a history line. A reader skips lines from a newer version.
 pub(crate) const VERSION: u32 = 1;
@@ -309,9 +310,54 @@ impl Slot {
     }
 }
 
+/// Slots waiting for the writer at most: 20 minutes of a disk that has stopped
+/// answering. A slot that finds the queue full is dropped and the status
+/// line says so.
+const QUEUE: usize = 8;
+
+/// The thread that rewrites the history file, so a slow disk or fsync never
+/// holds up the sensor thread that feeds the view and its alerts.
+struct Writer {
+    rows: Option<mpsc::SyncSender<Row>>,
+    results: mpsc::Receiver<Result<(), String>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Writer {
+    fn start(path: PathBuf) -> std::io::Result<Self> {
+        let (rows, queue) = mpsc::sync_channel::<Row>(QUEUE);
+        let (report, results) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("systemscape-record".into())
+            .spawn(move || {
+                for row in queue {
+                    if report.send(write(&path, &row)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            rows: Some(rows),
+            results,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Writer {
+    /// Finish the slots already queued before the recorder goes away.
+    fn drop(&mut self) {
+        drop(self.rows.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Appends each closed slot to the history file. Only built with `--record`.
 pub(crate) struct Recorder {
-    path: PathBuf,
+    /// Dropped before `_lock`, so queued slots are written under the lock.
+    writer: Option<Writer>,
     /// Held for the recorder's life: a second recorder finds the lock taken.
     _lock: Option<File>,
     slot: Option<Slot>,
@@ -322,31 +368,35 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
-    /// Prepare to record at `path`: create its directory owner-only and take
-    /// the directory lock. A failure here is not fatal: the recorder keeps
-    /// the reason, shows it, and writes nothing, so a read-only container
-    /// still shows telemetry.
+    /// Prepare to record at `path`: create its directory owner-only, take
+    /// the directory lock and start the writer thread. A failure here is not
+    /// fatal: the recorder keeps the reason, shows it, and writes nothing, so
+    /// a read-only container still shows telemetry.
     pub(crate) fn open(path: Option<PathBuf>) -> Self {
-        let Some(path) = path else {
-            return Self {
-                path: PathBuf::new(),
-                _lock: None,
-                slot: None,
-                trouble: Some("record: no HOME or XDG_STATE_HOME; nothing written".into()),
-                told: false,
-            };
-        };
-        let (lock, trouble) = match Self::lock(&path) {
-            Ok(lock) => (Some(lock), None),
-            Err(reason) => (None, Some(format!("record: {reason}; nothing written"))),
-        };
-        Self {
-            path,
-            _lock: lock,
+        let mut recorder = Self {
+            writer: None,
+            _lock: None,
             slot: None,
-            trouble,
+            trouble: None,
             told: false,
+        };
+        let Some(path) = path else {
+            recorder.trouble = Some("record: no HOME or XDG_STATE_HOME; nothing written".into());
+            return recorder;
+        };
+        let started = Self::lock(&path).and_then(|lock| {
+            let writer =
+                Writer::start(path).map_err(|e| format!("cannot start the writer: {e}"))?;
+            Ok((lock, writer))
+        });
+        match started {
+            Ok((lock, writer)) => {
+                recorder._lock = Some(lock);
+                recorder.writer = Some(writer);
+            }
+            Err(reason) => recorder.trouble = Some(format!("record: {reason}; nothing written")),
         }
+        recorder
     }
 
     fn lock(path: &Path) -> Result<File, String> {
@@ -370,15 +420,31 @@ impl Recorder {
         }
     }
 
+    /// Record a problem, or its end. Returns the problem when it is new.
+    fn trouble(&mut self, now: Option<String>) -> Option<String> {
+        let fresh = now
+            .clone()
+            .filter(|note| self.trouble.as_ref() != Some(note));
+        self.trouble = now;
+        fresh
+    }
+
     /// Fold one sensor poll taken at unix second `now`. When it opens a new
-    /// slot, the slot before is written. A standing problem is added to the
-    /// snapshot's notes for the status line; the return value is the problem
-    /// when it first appears, for a probe to print once.
+    /// slot, the slot before is handed to the writer thread, which never
+    /// blocks this one; its outcome shows on a later poll. A standing problem
+    /// is added to the snapshot's notes for the status line; the return
+    /// value is the problem when it first appears, for a probe to print once.
     pub(crate) fn fold(&mut self, snapshot: &mut Snapshot, now: f64) -> Option<String> {
-        if self._lock.is_none() {
+        let Some(writer) = &self.writer else {
             snapshot.notes.extend(self.trouble.clone());
             let first = !std::mem::replace(&mut self.told, true);
             return self.trouble.clone().filter(|_| first);
+        };
+        let outcomes: Vec<Result<(), String>> = writer.results.try_iter().collect();
+        let mut fresh = None;
+        for outcome in outcomes {
+            let note = outcome.err().map(|reason| format!("record: {reason}"));
+            fresh = self.trouble(note).or(fresh);
         }
         let t = (now / SLOT_SECS as f64).floor() as i64 * SLOT_SECS;
         let closed = match &mut self.slot {
@@ -392,17 +458,21 @@ impl Recorder {
         if let Some(slot) = &mut self.slot {
             slot.fold(snapshot);
         }
-        let mut fresh = None;
         if let Some(closed) = closed.filter(|s| !s.partial && s.n > 0) {
-            match write(&self.path, &closed.row()) {
-                Ok(()) => self.trouble = None,
-                Err(reason) => {
-                    let note = format!("record: {reason}");
-                    if self.trouble.as_ref() != Some(&note) {
-                        fresh = Some(note.clone());
-                    }
-                    self.trouble = Some(note);
+            let queued = self
+                .writer
+                .as_ref()
+                .and_then(|w| w.rows.as_ref())
+                .map(|rows| rows.try_send(closed.row()));
+            let note = match queued {
+                Some(Ok(())) => None,
+                Some(Err(mpsc::TrySendError::Full(_))) => {
+                    Some("record: the disk is not keeping up; a slot was dropped".to_owned())
                 }
+                _ => Some("record: the writer has stopped; nothing written".to_owned()),
+            };
+            if note.is_some() {
+                fresh = self.trouble(note).or(fresh);
             }
         }
         snapshot.notes.extend(self.trouble.clone());
@@ -539,6 +609,8 @@ mod tests {
             "nothing until a full slot closes"
         );
         recorder.fold(&mut reading(999.0, 1.0, Some(1.0)), t0 + 300.0);
+        // Dropping the recorder waits for the writer to finish its queue.
+        drop(recorder);
         let Loaded::Read(history) = load(Some(&path)) else {
             panic!("history not written");
         };
@@ -680,6 +752,39 @@ mod tests {
         drop(first);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
+    #[test]
+    fn a_failed_write_shows_on_a_later_poll_and_is_reported_once() {
+        let path = scratch("writer");
+        let mut recorder = Recorder::open(Some(path.clone()));
+        // A directory at the final path: the writer refuses it.
+        fs::create_dir_all(&path).unwrap();
+        let t0 = 1_763_000_000.0 - 1_763_000_000.0 % 150.0;
+        recorder.fold(&mut reading(1.0, 1.0, None), t0 + 10.0);
+        recorder.fold(&mut reading(1.0, 1.0, None), t0 + 150.0);
+        recorder.fold(&mut reading(1.0, 1.0, None), t0 + 300.0);
+        let mut told = Vec::new();
+        let mut notes = Vec::new();
+        for _ in 0..200 {
+            let mut snapshot = reading(1.0, 1.0, None);
+            told.extend(recorder.fold(&mut snapshot, t0 + 310.0));
+            notes = snapshot.notes;
+            if !notes.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            notes.iter().any(|n| n.contains("not a regular file")),
+            "{notes:?}"
+        );
+        let mut snapshot = reading(1.0, 1.0, None);
+        told.extend(recorder.fold(&mut snapshot, t0 + 320.0));
+        assert_eq!(told.len(), 1, "reported once: {told:?}");
+        assert_eq!(snapshot.notes, notes, "and shown until a write succeeds");
+        drop(recorder);
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
     #[test]
     fn a_state_directory_others_can_write_to_is_refused() {
         use std::os::unix::fs::PermissionsExt;

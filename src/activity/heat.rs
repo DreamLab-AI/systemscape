@@ -20,7 +20,10 @@ use crate::activity_data::{clean, Event};
 use crate::pixels::{mix, PixelCanvas, Rgb};
 use crate::telemetry::record::{self, History, Loaded, Row};
 use crossterm::event::KeyCode;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// How often the history file is read again while heat is on and visible.
@@ -88,6 +91,20 @@ pub(super) enum View<'a> {
 pub(super) struct Tint<'a> {
     history: &'a History,
     now: f64,
+    /// Each session's stack, worked out on its first floor this render.
+    stacks: RefCell<HashMap<StackKey, Rc<Stack>>>,
+}
+
+/// A session's record list (its address and length) and the scale it is
+/// stacked at. A `Tint` lives for one render, while the records cannot move.
+type StackKey = (usize, usize, u64);
+
+/// A session's records as the city stacks them: where each record's part of
+/// the tower ends, and the machine's measure when it was made.
+struct Stack {
+    /// Top of each record's part, rising from the ground.
+    tops: Vec<f64>,
+    measures: Vec<Option<f64>>,
 }
 
 /// The heat view for UTC day `day` (`YYYY-MM-DD`) as of `now`.
@@ -107,21 +124,22 @@ pub(super) fn view<'a>(heat: &'a Heat, day: &str, now: f64) -> View<'a> {
         }
         Some(Loaded::Read(history)) => history,
     };
-    let tint = Tint { history, now };
+    let tint = Tint::new(history, now);
     let start = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
         .ok()
         .and_then(|d| d.and_hms_opt(0, 0, 0))
         .map(|d| d.and_utc().timestamp() as f64);
-    let covered = start.is_some_and(|start| {
-        history
-            .rows
-            .iter()
-            .any(|r| r.t as f64 >= start && (r.t as f64) < start + 86_400.0 && tint.usable(r))
-    });
-    if covered {
+    let on_day = |r: &&Row| {
+        start.is_some_and(|start| r.t as f64 >= start && (r.t as f64) < start + 86_400.0)
+    };
+    if history.rows.iter().filter(on_day).any(|r| tint.usable(r)) {
         return View::Ready(tint);
     }
-    let reason = if history.rows.is_empty() && history.newer > 0 {
+    let reason = if history.rows.iter().any(|r| on_day(&r)) {
+        // The day was recorded, but `now` (a replay's cut-off) is before
+        // its first slot closed.
+        "no recorded slot had closed yet at this time".to_owned()
+    } else if history.rows.is_empty() && history.newer > 0 {
         "the history is from a newer SystemScape".to_owned()
     } else {
         match (history.rows.first(), history.rows.last()) {
@@ -159,7 +177,15 @@ fn ramp(n: f64) -> Rgb {
     }
 }
 
-impl Tint<'_> {
+impl<'a> Tint<'a> {
+    pub(super) fn new(history: &'a History, now: f64) -> Self {
+        Self {
+            history,
+            now,
+            stacks: RefCell::default(),
+        }
+    }
+
     /// A slot counts once it had closed by `now`.
     fn usable(&self, row: &Row) -> bool {
         row.end() as f64 <= self.now
@@ -173,29 +199,55 @@ impl Tint<'_> {
             .filter(|r| self.usable(r))
     }
 
+    /// The session's stack: each record's top and measure, in one pass that
+    /// parses each timestamp once, kept for the rest of this render.
+    fn stack(&self, records: &[&Event], scale: f64) -> Rc<Stack> {
+        let key = (records.as_ptr() as usize, records.len(), scale.to_bits());
+        if let Some(stack) = self.stacks.borrow().get(&key) {
+            return Rc::clone(stack);
+        }
+        let mut y = 0.0;
+        let mut stack = Stack {
+            tops: Vec::with_capacity(records.len()),
+            measures: Vec::with_capacity(records.len()),
+        };
+        for record in records {
+            // The same sum, in the same order, as the city's floors.
+            y += Mark::of(record).weight() * scale;
+            stack.tops.push(y);
+            stack
+                .measures
+                .push(self.reading(seconds(&record.at)).and_then(measure));
+        }
+        let stack = Rc::new(stack);
+        self.stacks.borrow_mut().insert(key, Rc::clone(&stack));
+        stack
+    }
+
     /// The highest measure among the records of a session (oldest first)
     /// whose part of the stack overlaps the floor from `span.0` to `span.1`.
     /// Records stack in order, each `weight × scale` tall, exactly as the
     /// city's floors do, so a merged floor covers the records it merged.
+    /// Only the floor's own records are visited.
     pub(super) fn floor_measure(
         &self,
         records: &[&Event],
         scale: f64,
         span: (f64, f64),
     ) -> Option<f64> {
-        let mut y = 0.0;
+        let stack = self.stack(records, scale);
+        // Every weight is positive, so the tops rise and the first record
+        // reaching above the floor's base is found by bisection.
+        let first = stack.tops.partition_point(|top| *top <= span.0 + 1e-9);
         let mut found: Option<f64> = None;
-        for record in records {
-            let top = y + Mark::of(record).weight() * scale;
-            if y >= span.1 - 1e-9 {
+        for i in first..stack.tops.len() {
+            let bottom = if i == 0 { 0.0 } else { stack.tops[i - 1] };
+            if bottom >= span.1 - 1e-9 {
                 break;
             }
-            if top > span.0 + 1e-9 {
-                if let Some(n) = self.reading(seconds(&record.at)).and_then(measure) {
-                    found = Some(found.map_or(n, |f: f64| f.max(n)));
-                }
+            if let Some(n) = stack.measures[i] {
+                found = Some(found.map_or(n, |f: f64| f.max(n)));
             }
-            y = top;
         }
         found
     }
@@ -435,10 +487,7 @@ mod tests {
             ],
             ..History::default()
         };
-        let tint = Tint {
-            history: &history,
-            now: base as f64 + 10_000.0,
-        };
+        let tint = Tint::new(&history, base as f64 + 10_000.0);
         let events: Vec<Event> = [10.0, 160.0, 310.0, 460.0]
             .iter()
             .map(|dt| event(base as f64 + dt, "tool"))
@@ -471,10 +520,7 @@ mod tests {
         ];
         let records: Vec<&Event> = events.iter().collect();
         // `now` inside the second slot: that slot had not closed yet.
-        let tint = Tint {
-            history: &history,
-            now: base as f64 + 250.0,
-        };
+        let tint = Tint::new(&history, base as f64 + 250.0);
         assert_eq!(tint.floor_measure(&records, 1.0, (0.5, 1.0)), None);
         assert_eq!(tint.floor_measure(&records, 1.0, (0.0, 0.5)), Some(0.5));
         let energy = tint.energy(base as f64, base as f64 + 300.0);
@@ -494,10 +540,7 @@ mod tests {
             ],
             ..History::default()
         };
-        let tint = Tint {
-            history: &history,
-            now: base as f64 + 100_000.0,
-        };
+        let tint = Tint::new(&history, base as f64 + 100_000.0);
         let energy = tint.energy(base as f64 + 75.0, base as f64 + 675.0);
         assert_eq!(energy.covered, 150.0, "75 s of each powered slot");
         assert!((energy.wh - (360.0 * 75.0 + 744.0 * 75.0) / 3600.0).abs() < 1e-9);
@@ -567,12 +610,131 @@ mod tests {
             view(&heat, day, midnight + 3600.0),
             View::Ready(_)
         ));
-        assert!(
-            matches!(view(&heat, day, midnight + 700.0), View::Unavailable(_)),
-            "a slot still open at `now` does not count"
-        );
+        let View::Unavailable(text) = view(&heat, day, midnight + 700.0) else {
+            panic!("a slot still open at `now` does not count");
+        };
+        assert_eq!(text, "no recorded slot had closed yet at this time");
+        let View::Unavailable(text) = view(&heat, day, midnight + 60.0) else {
+            panic!("early in a replay of a recorded day");
+        };
+        assert!(!text.contains("no recorded history"), "{text}");
         heat.on = false;
         assert!(matches!(view(&heat, day, midnight + 3600.0), View::Off));
+    }
+
+    /// One session of `n` records over the last two hours, in runs of reads,
+    /// shell calls and edits with an occasional prompt and error, so the
+    /// tower has many floors of different heights.
+    fn tall_tower(n: usize, now: f64) -> Vec<Event> {
+        (0..n)
+            .map(|i| {
+                let mut record = event(now - 7_200.0 + 7_190.0 * i as f64 / n as f64, "tool");
+                record.key = format!("r{i}");
+                match i {
+                    _ if i % 97 == 0 => record.kind = "failure".into(),
+                    _ if i % 41 == 0 => record.kind = "prompt".into(),
+                    _ => {
+                        record.text = ["Read src/a.rs", "Bash cargo test", "Edit src/b.rs"]
+                            [(i / 13) % 3]
+                            .into()
+                    }
+                }
+                record
+            })
+            .collect()
+    }
+
+    /// The quadratic walk the stack replaced: every floor from the ground,
+    /// every timestamp parsed again. Kept as the reference result.
+    fn walk_from_the_ground(
+        tint: &Tint,
+        records: &[&Event],
+        scale: f64,
+        span: (f64, f64),
+    ) -> Option<f64> {
+        let mut y = 0.0;
+        let mut found: Option<f64> = None;
+        for record in records {
+            let top = y + Mark::of(record).weight() * scale;
+            if y >= span.1 - 1e-9 {
+                break;
+            }
+            if top > span.0 + 1e-9 {
+                if let Some(n) = tint.reading(seconds(&record.at)).and_then(measure) {
+                    found = Some(found.map_or(n, |f: f64| f.max(n)));
+                }
+            }
+            y = top;
+        }
+        found
+    }
+
+    #[test]
+    fn one_pass_per_tower_gives_the_same_floors_as_walking_from_the_ground() {
+        use super::super::{bands, city, layout, tower_scale, State};
+        let now = 1_763_400_000.0;
+        let history = demo_history(now);
+        for events in [tall_tower(2_000, now), crate::activity_data::demo_events()] {
+            let now = events.iter().map(|e| seconds(&e.at)).fold(now, f64::max);
+            let mut state = State::default();
+            let shown = city(&events, &mut state);
+            let lay = layout(&shown, 1.0);
+            let scale = tower_scale(&shown, &lay);
+            let tint = Tint::new(&history, now);
+            let mut floors = 0;
+            for session in &shown.sessions {
+                let mut y = 0.0;
+                for (height, _) in bands(session, scale) {
+                    let span = (y, y + height);
+                    assert_eq!(
+                        tint.floor_measure(&session.records, scale, span),
+                        walk_from_the_ground(&tint, &session.records, scale, span),
+                        "floor {span:?}"
+                    );
+                    // Spans that start or end inside a record, too.
+                    let inner = (y + height * 0.3, y + height * 0.7);
+                    assert_eq!(
+                        tint.floor_measure(&session.records, scale, inner),
+                        walk_from_the_ground(&tint, &session.records, scale, inner)
+                    );
+                    y += height;
+                    floors += 1;
+                }
+            }
+            assert!(floors > 10, "{floors} floors is too few to test");
+            assert_eq!(
+                tint.stacks.borrow().len(),
+                shown.sessions.len(),
+                "one stack per tower"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "timing, run by hand with --ignored --nocapture"]
+    fn time_heat_on_a_large_tower() {
+        use super::super::{build_scene, city, layout, State};
+        let now = 1_763_400_000.0;
+        let events = tall_tower(2_000, now);
+        let mut state = State::default();
+        let shown = city(&events, &mut state);
+        let lay = layout(&shown, 1.0);
+        let history = demo_history(now);
+        let frames = 200;
+        let time = |heat: bool| {
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                let tint = Tint::new(&history, now);
+                let tint = heat.then_some(&tint);
+                std::hint::black_box(build_scene(&shown, &lay, 0, 0.0, now, tint));
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(frames)
+        };
+        let floors =
+            super::super::bands(&shown.sessions[0], super::super::tower_scale(&shown, &lay)).len();
+        eprintln!("{floors} floors");
+        let (plain, heated) = (time(false), time(true));
+        eprintln!("2,000-record tower: {plain:.3} ms/frame plain, {heated:.3} ms/frame with heat");
     }
 
     #[test]
@@ -584,10 +746,7 @@ mod tests {
         let shown = city(&events, &mut state);
         let lay = layout(&shown, 1.0);
         let history = demo_history(now);
-        let tint = Tint {
-            history: &history,
-            now,
-        };
+        let tint = Tint::new(&history, now);
         let (_, plain) = build_scene(&shown, &lay, 0, 0.0, now, None);
         let (_, heated) = build_scene(&shown, &lay, 0, 0.0, now, Some(&tint));
         assert_eq!(plain.vertices, heated.vertices, "heat moves nothing");
