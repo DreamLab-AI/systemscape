@@ -59,8 +59,15 @@ try:
     for expected in ('MOST RECENT', 'VisionFlow', 'agentbox', 'systemscape', '▀', '●', ' ago'):
         assert expected in first, f'activity city missing: {expected}'
     assert '[ + ]' not in first and 'No action in sight' not in first, 'centre box must be gone'
-    assert 'ALERT  demo failed 1 session' in first, 'demo alert rules did not fire'
-    assert 'demo failed' in tmux('show-options', '-w', '-v', '-t', 'test:0', '@systemscape_activity')
+    # The view may count as off screen until tmux has seen the client attach.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        option = tmux('show-options', '-w', '-v', '-t', 'test:0', '@systemscape_activity', check=False)
+        if 'ALERT  demo failed 1 session' in capture() and 'demo failed' in option:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError('demo alert rules did not show in the banner and the tmux option')
     time.sleep(1.2)
     assert capture() != first, 'tour camera did not move'
     tmux('send-keys', '-t', 'test:0', 'j')
@@ -154,7 +161,8 @@ try:
         '[[host]]\nname = "probe"\n'
         f'command = ["{binary}", "--probe", "--interval", "0.5"]\n'
         '[[host]]\nname = "ghost"\ncommand = ["/nonexistent/systemscape", "--probe"]\n')
-    client = start(f'{binary} --hosts {hosts_file}')
+    # An empty config home: an operator's own alerts.toml must not change this run.
+    client = start(f'env XDG_CONFIG_HOME={hosts_file.parent} {binary} --hosts {hosts_file}')
     time.sleep(2.5)
     strip = capture()
     for expected in ('▸● here', '● probe', '! ghost', 'Tab host'):

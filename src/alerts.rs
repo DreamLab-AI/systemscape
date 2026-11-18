@@ -66,9 +66,9 @@ impl View {
 pub(crate) enum Notifier {
     /// BEL, which tmux handles itself (its `bell-action`).
     Bell,
-    /// OSC 9 desktop notification (iTerm2, WezTerm, Windows Terminal, kitty, foot…).
+    /// OSC 9 desktop notification, where the terminal implements it.
     Osc9,
-    /// OSC 777 `notify` (urxvt, VTE terminals, foot, Ghostty…).
+    /// OSC 777 `notify`, where the terminal implements it.
     Osc777,
     /// `tmux display-message` in this pane's client.
     TmuxMessage,
@@ -1374,7 +1374,7 @@ impl Alerts {
         let mut lines = vec![(
             format!(
                 "ALERT RULES · {} · {} for this view",
-                self.origin,
+                clean(&self.origin),
                 self.book.rules.len()
             ),
             (63, 235, 255),
@@ -1658,9 +1658,51 @@ mod tests {
             .collect()
     }
 
+    /// The example file with its commented-out rules switched on: the rules
+    /// that need a hosts file naming `render-box`.
+    fn federated_example() -> String {
+        let keys = [
+            "name",
+            "when",
+            "channel",
+            "host",
+            "above",
+            "clear",
+            "for",
+            "notify",
+            "rate_limit",
+        ];
+        let setting = |rule: &str| {
+            rule == "[[rule]]"
+                || rule
+                    .split_once(" = ")
+                    .is_some_and(|(k, _)| keys.contains(&k))
+        };
+        include_str!("../docs/alerts.example.toml")
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rule) if setting(rule) => rule,
+                _ => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_example_file_works_as_copied_on_one_machine() {
+        let rules = parse(include_str!("../docs/alerts.example.toml")).unwrap();
+        let telemetry: Vec<Rule> = rules
+            .into_iter()
+            .filter(|r| r.trigger.view() == View::Telemetry)
+            .collect();
+        assert_eq!(bind(&telemetry, &[(String::new(), false)], false), Ok(()));
+    }
+
     #[test]
     fn the_documented_example_file_parses_with_rules_for_both_views() {
-        let rules = parse(include_str!("../docs/alerts.example.toml")).unwrap();
+        let rules = parse(&federated_example()).unwrap();
+        assert!(rules.iter().any(|r| r.name == "host-lost"));
+        assert!(rules.iter().any(|r| r.name == "render-box-power"));
         let views: Vec<View> = rules.iter().map(|r| r.trigger.view()).collect();
         assert!(views.contains(&View::Telemetry) && views.contains(&View::Activity));
         let kinds = [
@@ -2043,7 +2085,7 @@ mod tests {
         );
         // Every message any rule can produce is free of tmux formats, OSC
         // separators and controls.
-        let rules = parse(include_str!("../docs/alerts.example.toml")).unwrap();
+        let rules = parse(&federated_example()).unwrap();
         for (index, rule) in rules.iter().enumerate() {
             for fired in [true, false] {
                 let change = Change {
@@ -2206,7 +2248,7 @@ mod tests {
     #[test]
     fn the_banner_and_rule_list_fill_every_pane_size_exactly() {
         let sink = Recorder::default();
-        let rules = parse(include_str!("../docs/alerts.example.toml"))
+        let rules = parse(&federated_example())
             .unwrap()
             .into_iter()
             .filter(|r| r.trigger.view() == View::Telemetry)

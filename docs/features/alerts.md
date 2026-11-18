@@ -71,8 +71,8 @@ only.
 | Name | What is sent |
 |---|---|
 | `bell` | BEL. Inside tmux it is not wrapped: tmux handles bells itself (`bell-action`, `visual-bell`, `monitor-bell`). |
-| `osc9` | `ESC ] 9 ; text BEL`: a desktop notification in iTerm2, WezTerm, Windows Terminal, kitty, foot and others. |
-| `osc777` | `ESC ] 777 ; notify ; SystemScape ; text BEL`: urxvt, VTE-based terminals, foot, Ghostty and others. |
+| `osc9` | `ESC ] 9 ; text BEL`: a desktop notification in terminals that implement it, for example iTerm2 and WezTerm. |
+| `osc777` | `ESC ] 777 ; notify ; SystemScape ; text BEL`: a desktop notification in terminals that implement it, for example urxvt and foot. |
 | `tmux-message` | `tmux display-message -t $TMUX_PANE text`, passed as an argv. |
 | `tmux-option` | Window option `@systemscape_telemetry` or `@systemscape_activity`, holding the names of firing rules (comma separated) and unset when none fire, and on exit. A status line can show it, for example `set -g window-status-format '#I:#W#{?@systemscape_telemetry, !#{@systemscape_telemetry},}'`. |
 
@@ -149,6 +149,11 @@ refuses `--alerts`.
   effect on the next start.
 - Two SystemScape views of the same kind in one tmux window share one window
   option. Telemetry and activity use different options.
+- The tmux option is unset on a normal quit or an unwind. It is not unset if
+  the process is killed by a signal.
+- The copied example file works on one machine as it stands. Its two rules
+  that need a hosts file (`render-box-power`, `host-lost`) are commented out
+  until you uncomment them.
 - No command hook: a rule cannot run a program.
 - Delivery of OSC notifications depends on the terminal. A terminal that does
   not understand OSC 9 or OSC 777 ignores it silently.

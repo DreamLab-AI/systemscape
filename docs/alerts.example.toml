@@ -43,27 +43,29 @@ clear = 40
 for = 30
 notify = ["tmux-option"]
 
-[[rule]]
-name = "render-box-power"
-when = "channel"
-channel = "PWR"
-host = "render-box"   # a name from the hosts file
-above = 800
-clear = 650
-for = 120
-notify = ["osc777", "tmux-message"]
-rate_limit = 300
+# A rule pinned to one host needs a hosts file that names it, so it is
+# commented out here; uncomment it once render-box is in your hosts file.
+# [[rule]]
+# name = "render-box-power"
+# when = "channel"
+# channel = "PWR"
+# host = "render-box"
+# above = 800
+# clear = 650
+# for = 120
+# notify = ["osc777", "tmux-message"]
+# rate_limit = 300
 
 # Telemetry: a remote host with no live link (connecting, stale or down) for
 # `for` seconds. Clears when readings arrive again. Without `host`, every
 # remote host is watched; this machine's own link cannot be lost.
-# Needs a hosts file with at least one [[host]]: delete this rule if you watch
-# only this machine.
-[[rule]]
-name = "host-lost"
-when = "link-lost"
-for = 45
-notify = ["bell", "tmux-message"]
+# Needs a hosts file with at least one [[host]], so it is commented out here;
+# uncomment it once you watch other machines.
+# [[rule]]
+# name = "host-lost"
+# when = "link-lost"
+# for = 45
+# notify = ["bell", "tmux-message"]
 
 # Activity: a session whose newest record is an error, quiet for `for` seconds
 # (default 60) and no older than `within` (default 600). Older endings never
