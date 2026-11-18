@@ -59,6 +59,15 @@ try:
     for expected in ('MOST RECENT', 'VisionFlow', 'agentbox', 'systemscape', '▀', '●', ' ago'):
         assert expected in first, f'activity city missing: {expected}'
     assert '[ + ]' not in first and 'No action in sight' not in first, 'centre box must be gone'
+    # The view may count as off screen until tmux has seen the client attach.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        option = tmux('show-options', '-w', '-v', '-t', 'test:0', '@systemscape_activity', check=False)
+        if 'ALERT  demo failed 1 session' in capture() and 'demo failed' in option:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError('demo alert rules did not show in the banner and the tmux option')
     time.sleep(1.2)
     assert capture() != first, 'tour camera did not move'
     tmux('send-keys', '-t', 'test:0', 'j')
@@ -119,6 +128,19 @@ try:
     held = capture()
     assert 'HOLDING' in held
     off_screen_then_back('telemetry')
+    # The demo's synthetic signal fires a rule every 24 s for about six.
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        option = tmux('show-options', '-w', '-v', '-t', 'test:0', '@systemscape_telemetry', check=False)
+        if 'ALERT  demo heat DEMO' in capture() and 'demo heat' in option:
+            break
+        time.sleep(0.3)
+    else:
+        raise AssertionError('the demo alert never showed in the banner and the tmux option')
+    tmux('send-keys', '-t', 'test:0', '!')
+    time.sleep(0.3)
+    assert 'ALERT RULES' in capture() and 'cpu hot' in capture(), '! lists the rules'
+    tmux('send-keys', '-t', 'test:0', '!')
     tmux('resize-window', '-t', 'test:0', '-x', '47', '-y', '27')
     time.sleep(0.3)
     narrow = capture()
@@ -139,7 +161,8 @@ try:
         '[[host]]\nname = "probe"\n'
         f'command = ["{binary}", "--probe", "--interval", "0.5"]\n'
         '[[host]]\nname = "ghost"\ncommand = ["/nonexistent/systemscape", "--probe"]\n')
-    client = start(f'{binary} --hosts {hosts_file}')
+    # An empty config home: an operator's own alerts.toml must not change this run.
+    client = start(f'env XDG_CONFIG_HOME={hosts_file.parent} {binary} --hosts {hosts_file}')
     time.sleep(2.5)
     strip = capture()
     for expected in ('▸● here', '● probe', '! ghost', 'Tab host'):
@@ -158,6 +181,6 @@ try:
     assert subprocess.run(['tmux', '-L', socket, 'has-session', '-t', 'test'], capture_output=True).returncode != 0
     left = subprocess.run(['pgrep', '-af', f'{binary} --probe'], capture_output=True, text=True).stdout
     assert left.strip() == '', f'quit left a probe running: {left}'
-    print('PASS: activity city, session select, detail list, source, small-pane list; telemetry ridges, labels, hold and narrow sparklines; both views idle off screen, keep updating in a visible split pane, and resume; host strip, probe host, missing-probe status, no probe left after quit; tiny resize and quit')
+    print('PASS: activity city, session select, detail list, source, small-pane list; telemetry ridges, labels, hold and narrow sparklines; both views idle off screen, keep updating in a visible split pane, and resume; host strip, probe host, missing-probe status, no probe left after quit; demo alert banners, rule list and tmux option; tiny resize and quit')
 finally:
     tmux('kill-server', check=False)

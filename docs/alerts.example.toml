@@ -1,0 +1,95 @@
+# SystemScape alert rules.
+#
+# Copy to ~/.config/systemscape/alerts.toml (or $XDG_CONFIG_HOME/systemscape/alerts.toml),
+# or pass it with --alerts FILE. Both views read the whole file: `channel` and
+# `link-lost` rules belong to telemetry, `session-error`, `error-burst` and
+# `quiet` to activity. One wrong rule and both views refuse the file and say why.
+#
+# Every rule has:
+#   name        1-24 letters, digits, spaces, '-', '_' or '.' (it is sent to tmux
+#               and the terminal, so nothing else is allowed)
+#   when        the kind of rule, below
+#   notify      any of "bell", "osc9", "osc777", "tmux-message", "tmux-option";
+#               empty or absent means the on-screen banner only
+#   rate_limit  minimum seconds between notifications from this rule (default 60);
+#               the tmux option and the banner are never held back
+#
+# Durations are seconds. Notifications name the rule, a host by its number in
+# the host strip (the 1-9 key), and numbers: never a host name or record text.
+
+# Telemetry: a channel, named exactly as the view labels it (CPU°, GPU0°, DISK°,
+# PWR, LOAD, MEM, GPU0%, VRAM0, IO, NET). Temperatures are °C, PWR watts, LOAD,
+# MEM and GPU% percent, VRAM GiB used, IO and NET MB/s.
+# Set `above` or `below`, and `clear` on the safe side of it: a firing rule
+# clears only once the value reaches `clear`, so a value hovering at the
+# threshold fires once, not again and again. `for` is how long the value must
+# stay beyond the threshold (default 0). Without `host` the rule watches every
+# host separately; `host` needs a hosts file that names it.
+[[rule]]
+name = "cpu-hot"
+when = "channel"
+channel = "CPU°"
+above = 85
+clear = 80
+for = 60
+notify = ["bell", "osc9"]
+
+[[rule]]
+name = "vram-full"
+when = "channel"
+channel = "VRAM0"
+above = 44            # GiB
+clear = 40
+for = 30
+notify = ["tmux-option"]
+
+# A rule pinned to one host needs a hosts file that names it, so it is
+# commented out here; uncomment it once render-box is in your hosts file.
+# [[rule]]
+# name = "render-box-power"
+# when = "channel"
+# channel = "PWR"
+# host = "render-box"
+# above = 800
+# clear = 650
+# for = 120
+# notify = ["osc777", "tmux-message"]
+# rate_limit = 300
+
+# Telemetry: a remote host with no live link (connecting, stale or down) for
+# `for` seconds. Clears when readings arrive again. Without `host`, every
+# remote host is watched; this machine's own link cannot be lost.
+# Needs a hosts file with at least one [[host]], so it is commented out here;
+# uncomment it once you watch other machines.
+# [[rule]]
+# name = "host-lost"
+# when = "link-lost"
+# for = 45
+# notify = ["bell", "tmux-message"]
+
+# Activity: a session whose newest record is an error, quiet for `for` seconds
+# (default 60) and no older than `within` (default 600). Older endings never
+# fire, so opening the view on a day of history does not set off old alerts.
+[[rule]]
+name = "session-failed"
+when = "session-error"
+for = 60
+within = 600
+notify = ["osc9", "tmux-option"]
+
+# Activity: a session with more than `errors` errors in the last `within`
+# seconds. Clears once that session has had no error for `within` seconds.
+[[rule]]
+name = "error-burst"
+when = "error-burst"
+errors = 5
+within = 600          # 10 minutes
+notify = ["bell"]
+
+# Activity: no record from any session for `for` seconds, once a record newer
+# than that has been seen while the view runs. Clears with the next record.
+[[rule]]
+name = "agents-quiet"
+when = "quiet"
+for = 1800            # 30 minutes
+notify = ["tmux-message"]

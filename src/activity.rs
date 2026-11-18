@@ -1441,6 +1441,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     );
     let mut archive = std::env::var_os("AGENTBOX_EVENT_ARCHIVE_DIR").map(PathBuf::from);
     let (mut demo, mut text, mut json, mut snapshot) = (false, false, false, false);
+    let mut alerts_file: Option<PathBuf> = None;
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1449,7 +1450,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             "--text" => text = true,
             "--json" => json = true,
             "--snapshot" => snapshot = true,
-            "--home" | "--workspace" | "--archive" => {
+            "--home" | "--workspace" | "--archive" | "--alerts" => {
                 let value = iter.next().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -1462,6 +1463,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                         home_override = true;
                     }
                     "--workspace" => workspace = value.into(),
+                    "--alerts" => alerts_file = Some(value.into()),
                     _ => archive = Some(value.into()),
                 }
             }
@@ -1491,6 +1493,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
     } else {
         collector.coverage()
     };
+    let one_shot = text || json || snapshot || !io::stdout().is_terminal();
+    if alerts_file.is_some() && one_shot {
+        let why = "--alerts applies to the live view, not --text, --json or --snapshot";
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
     if text || json || (!snapshot && !io::stdout().is_terminal()) {
         if json {
             println!(
@@ -1535,6 +1542,8 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
+    let mut alerts =
+        crate::alerts::Alerts::activity(alerts_file.as_deref(), demo).map_err(io::Error::other)?;
     let _terminal = crate::Terminal::enter()?;
     let mut next_poll = Instant::now() + POLL;
     let mut dirty = true;
@@ -1560,9 +1569,14 @@ pub fn run(args: &[String]) -> io::Result<()> {
             coverage = new_coverage;
             next_poll = Instant::now() + POLL;
         }
+        // Rules see only what this view has read, so like it they rest off screen.
+        if visible && alerts.due() {
+            dirty |= alerts.observe_activity(&events);
+        }
         let now = unix_now();
         let dims = crate::term_dims();
-        let in_list = state.flat || dims.0 < 80 || dims.1 < 20;
+        let (width, height) = alerts.view_dims(dims);
+        let in_list = state.flat || width < 80 || height < 20;
         // The tour animates only while the view has the keyboard. Visible but
         // unfocused, it stays current and redraws twice a second.
         let flying = sight.focused() && state.tour && !in_list;
@@ -1579,10 +1593,9 @@ pub fn run(args: &[String]) -> io::Result<()> {
         if buffer.dims != dims
             || visible && (dirty || flying || drawn.elapsed() >= Duration::from_millis(500))
         {
-            buffer.present_rows(
-                render(&events, &coverage, &mut state, dims, demo, now),
-                dims,
-            )?;
+            let view = alerts.view_dims(dims);
+            let rows = render(&events, &coverage, &mut state, view, demo, now);
+            buffer.present_rows(alerts.dress(rows, dims), dims)?;
             dirty = false;
             drawn = Instant::now();
         }
@@ -1604,6 +1617,12 @@ pub fn run(args: &[String]) -> io::Result<()> {
             }
             Input::FocusLost => {
                 sight.focus(false);
+            }
+            Input::Key(key)
+                if key.kind != KeyEventKind::Release && key.code == KeyCode::Char('!') =>
+            {
+                alerts.toggle_list();
+                dirty = true;
             }
             Input::Key(key) if key.kind != KeyEventKind::Release => {
                 match handle_key(&mut state, key, &events, in_list) {
