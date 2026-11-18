@@ -39,7 +39,7 @@ fn clean_path(s: &str) -> Option<String> {
     let path: String = s
         .trim()
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .take(1024)
         .collect();
     (!path.is_empty()).then_some(path)
@@ -66,15 +66,17 @@ fn codex_path(payload: &Value) -> Option<String> {
         .and_then(|arguments| tool_path(&arguments))
 }
 
+/// Directional formatting and invisible text carriers.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' |
+        '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+}
+
 /// Strip terminal controls, directional formatting and invisible text carriers.
 pub fn clean(s: &str) -> String {
     s.chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(*c,
-        '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' |
-        '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
-        })
+        .filter(|c| !c.is_control() && !invisible(*c))
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
