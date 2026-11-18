@@ -374,7 +374,7 @@ fn exit_reason(code: Option<i32>, via_ssh: bool, stderr: &str, frames: u64) -> S
 
 /// Parse one probe line. `Ok(None)` is a line to skip; an error means the
 /// probe speaks another protocol version and retrying soon will not help.
-fn read_frame(line: &str) -> Result<Option<Snapshot>, String> {
+pub(crate) fn read_frame(line: &str) -> Result<Option<Snapshot>, String> {
     let line = line.trim();
     if line.is_empty() {
         return Ok(None);

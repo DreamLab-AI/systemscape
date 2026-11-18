@@ -8,6 +8,7 @@
 use crate::activity::{clip_scene, project};
 use crate::hosts::{self, Federation, Link, Remote, Report};
 use crate::pixels::{mix, PixelCanvas, Rgb};
+use crate::sensors::{self, GpuApp, Reading};
 use crate::{
     ColChar, Colour, DisplayMode, Face, Mesh3D, Modifier, Transform3D, Vec2D, Vec3D, Viewport,
 };
@@ -47,9 +48,11 @@ enum Kind {
     Vram,
     Io,
     Net,
+    /// A named reading from `Snapshot::extra`; see `Channel::extra`.
+    Extra,
 }
 
-struct Channel {
+pub(crate) struct Channel {
     kind: Kind,
     gpu: Option<usize>,
     /// Full-scale reference for kinds measured against a capacity (VRAM, GiB).
@@ -58,7 +61,40 @@ struct Channel {
     /// Peak seen since the current slot opened.
     slot_peak: f64,
     now: Option<f64>,
+    /// Name, unit and scale of a `Kind::Extra` channel; `None` for fixed kinds.
+    extra: Option<Extra>,
 }
+
+/// What a named channel is, taken from its latest reading.
+struct Extra {
+    name: String,
+    unit: String,
+    /// Full scale; `None` scales to the largest value in view.
+    full: Option<f64>,
+    log: bool,
+}
+
+impl Extra {
+    fn of(reading: &Reading) -> Self {
+        Self {
+            name: reading.name.clone(),
+            unit: reading.unit.clone(),
+            full: reading.full,
+            log: reading.log,
+        }
+    }
+}
+
+/// Extra ridges drawn at once; more would crowd out the fixed channels.
+const MAX_EXTRA_RIDGES: usize = 6;
+/// Extra channels remembered, live or with history still on screen.
+const MAX_EXTRA_CHANNELS: usize = 24;
+/// Anomaly band: mean ± `BAND_K` deviations over the finite history slots,
+/// judged only once `BAND_MIN_SLOTS` (half an hour) exist. The deviation is
+/// floored at `BAND_FLOOR` of full height, so a flat channel's noise is not news.
+const BAND_K: f64 = 3.0;
+const BAND_MIN_SLOTS: usize = 12;
+const BAND_FLOOR: f64 = 0.04;
 
 impl Channel {
     fn new(kind: Kind, gpu: Option<usize>) -> Self {
@@ -69,6 +105,56 @@ impl Channel {
             history: VecDeque::with_capacity(HISTORY),
             slot_peak: f64::NAN,
             now: None,
+            extra: None,
+        }
+    }
+
+    /// A channel for a named reading, already tidied by `sensors::tidy`.
+    fn named(reading: &Reading) -> Self {
+        let mut channel = Self::new(Kind::Extra, None);
+        channel.extra = Some(Extra::of(reading));
+        channel
+    }
+
+    /// Full scale of a named channel: its own, else the largest value in view.
+    fn extra_full(&self, extra: &Extra) -> f64 {
+        extra.full.unwrap_or_else(|| {
+            self.history
+                .iter()
+                .chain([&self.slot_peak])
+                .chain(self.now.as_ref())
+                .filter(|v| v.is_finite())
+                .fold(1.0, |a: f64, b| a.max(*b))
+        })
+    }
+
+    /// The channel's normal range in normalised height (0..1): mean ±
+    /// `BAND_K` standard deviations of its finite history slots, with the
+    /// deviation floored at `BAND_FLOOR`. `None` until `BAND_MIN_SLOTS` exist.
+    pub(crate) fn band(&self) -> Option<(f64, f64)> {
+        let heights: Vec<f64> = self
+            .history
+            .iter()
+            .filter(|v| v.is_finite())
+            .map(|v| self.norm(*v))
+            .collect();
+        if heights.len() < BAND_MIN_SLOTS {
+            return None;
+        }
+        let n = heights.len() as f64;
+        let mean = heights.iter().sum::<f64>() / n;
+        let deviation = (heights.iter().map(|h| (h - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let spread = BAND_K * deviation.max(BAND_FLOOR);
+        Some((mean - spread, mean + spread))
+    }
+
+    /// Whether the live value is above the channel's band. Only upward
+    /// excursions count: history holds 150 s peaks, so an instant reading
+    /// below the peaks' band is the normal case, not news.
+    pub(crate) fn anomalous(&self) -> bool {
+        match (self.now, self.band()) {
+            (Some(v), Some((_, high))) => self.norm(v) > high,
+            _ => false,
         }
     }
 
@@ -85,6 +171,11 @@ impl Channel {
             Kind::Vram => format!("VRAM{card}"),
             Kind::Io => "IO".into(),
             Kind::Net => "NET".into(),
+            Kind::Extra => self
+                .extra
+                .as_ref()
+                .map(|e| e.name.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -101,6 +192,21 @@ impl Channel {
             Kind::Vram => (90, 165, 255),
             Kind::Io => (130, 120, 255),
             Kind::Net => (200, 110, 240),
+            // Named channels take a hue from their name, steady from run to run.
+            Kind::Extra => {
+                let name = self.extra.as_ref().map_or("", |e| e.name.as_str());
+                let hash = name.bytes().fold(2_166_136_261u32, |h, b| {
+                    (h ^ u32::from(b)).wrapping_mul(16_777_619)
+                });
+                [
+                    (240, 140, 200),
+                    (150, 200, 255),
+                    (255, 170, 90),
+                    (140, 230, 170),
+                    (225, 215, 120),
+                    (185, 150, 255),
+                ][hash as usize % 6]
+            }
         };
         match self.gpu.map(|i| i % 3) {
             Some(1) => mix(base, (255, 255, 255), 0.25),
@@ -123,6 +229,11 @@ impl Channel {
             Kind::Vram => v / self.total.max(0.001),
             Kind::Io => log(5000.0),
             Kind::Net => log(1250.0),
+            Kind::Extra => match &self.extra {
+                Some(extra) if extra.log => log(self.extra_full(extra)),
+                Some(extra) => linear(0.0, self.extra_full(extra)),
+                None => 0.0,
+            },
         }
         .clamp(0.0, 1.0)
     }
@@ -135,6 +246,7 @@ impl Channel {
             Kind::Vram => format!("{v:.0}/{:.0}G", self.total),
             Kind::Io | Kind::Net if v < 10.0 => format!("{v:.1}MB/s"),
             Kind::Io | Kind::Net => format!("{v:.0}MB/s"),
+            Kind::Extra => sensors::format_value(v, self.extra.as_ref().map_or("", |e| &e.unit)),
         }
     }
 
@@ -190,6 +302,14 @@ pub(crate) struct Snapshot {
     pub(crate) mem_pct: Option<f64>,
     pub(crate) disk_mbps: Option<f64>,
     pub(crate) net_mbps: Option<f64>,
+    /// Named readings beyond the fixed kinds: containers, a model server.
+    pub(crate) extra: Vec<Reading>,
+    /// The processes holding the most VRAM on each card.
+    pub(crate) gpu_apps: Vec<GpuApp>,
+    /// Trouble from a background source, for the status line. Local only:
+    /// never sent by a probe.
+    #[serde(skip)]
+    pub(crate) notes: Vec<String>,
 }
 
 impl Snapshot {
@@ -214,6 +334,10 @@ impl Snapshot {
             Kind::Vram => gpu?.used_gib,
             Kind::Io => self.disk_mbps,
             Kind::Net => self.net_mbps,
+            Kind::Extra => {
+                let name = &channel.extra.as_ref()?.name;
+                self.extra.iter().find(|r| &r.name == name)?.value
+            }
         }
     }
 }
@@ -397,6 +521,7 @@ fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState, gpus: bool) ->
 
     if gpus {
         s.gpus = query_gpus();
+        s.gpu_apps = sensors::query_gpu_apps();
     }
 
     // CPU busy % from /proc/stat deltas
@@ -501,6 +626,47 @@ fn ensure_cards(channels: &mut Vec<Channel>, cards: usize) {
             }
         })
         .collect();
+    // Named channels are not per card: carry them over unchanged.
+    channels.extend(old.into_iter().filter(|c| c.kind == Kind::Extra));
+}
+
+/// Give each named reading a ridge, padded with gaps to stay aligned in
+/// time, and take its latest unit and scale. A named channel with no reading
+/// and no history left on screen is forgotten; past `MAX_EXTRA_CHANNELS`
+/// the silent ones go first.
+fn ensure_extras(channels: &mut Vec<Channel>, readings: &[Reading]) {
+    let committed = channels.iter().map(|c| c.history.len()).max().unwrap_or(0);
+    let reads = |c: &Channel| {
+        let name = c.extra.as_ref().map(|e| e.name.as_str());
+        readings.iter().any(|r| Some(r.name.as_str()) == name)
+    };
+    for reading in readings {
+        let found = channels
+            .iter_mut()
+            .find(|c| c.extra.as_ref().is_some_and(|e| e.name == reading.name));
+        match found {
+            Some(channel) => channel.extra = Some(Extra::of(reading)),
+            None => {
+                let mut fresh = Channel::named(reading);
+                fresh
+                    .history
+                    .extend(std::iter::repeat_n(f64::NAN, committed));
+                channels.push(fresh);
+            }
+        }
+    }
+    channels.retain(|c| c.kind != Kind::Extra || c.has_data() || reads(c));
+    let mut excess = channels
+        .iter()
+        .filter(|c| c.kind == Kind::Extra)
+        .count()
+        .saturating_sub(MAX_EXTRA_CHANNELS);
+    channels.retain(|c| {
+        let drop = excess > 0 && c.kind == Kind::Extra && !reads(c);
+        excess -= usize::from(drop);
+        !drop
+    });
+    channels.truncate(channels.len() - excess);
 }
 
 fn poll_into_channels(channels: &mut [Channel], snapshot: &Snapshot) {
@@ -548,6 +714,11 @@ fn demo_prefill(channels: &mut [Channel]) {
                 }
                 Kind::Io => 2.0 + 1400.0 * all_jobs + 600.0 * spike,
                 Kind::Net => 1.0 + 720.0 * burst + 950.0 * spike,
+                Kind::Extra => channel
+                    .extra
+                    .as_ref()
+                    .and_then(|e| sensors::demo_history(&e.name, t, jitter))
+                    .unwrap_or(f64::NAN),
             };
             if channel.history.len() == HISTORY {
                 channel.history.pop_front();
@@ -748,8 +919,67 @@ fn build_scene(
     (ground, ridges)
 }
 
+/// Channels with something to draw. Named channels are capped at
+/// `MAX_EXTRA_RIDGES`, live ones first; returns how many were left out.
+fn drawable(channels: &[Channel]) -> (Vec<&Channel>, usize) {
+    let (mut shown, mut extras): (Vec<&Channel>, Vec<&Channel>) = channels
+        .iter()
+        .filter(|c| c.has_data())
+        .partition(|c| c.kind != Kind::Extra);
+    extras.sort_by_key(|c| c.now.is_none());
+    let hidden = extras.len().saturating_sub(MAX_EXTRA_RIDGES);
+    extras.truncate(MAX_EXTRA_RIDGES);
+    shown.extend(extras);
+    (shown, hidden)
+}
+
+/// Background-source trouble and hidden ridges, for the start of the status line.
+fn status_notes(snapshot: &Snapshot, hidden: usize) -> String {
+    let mut notes: String = snapshot
+        .notes
+        .iter()
+        .map(|note| format!("{} · ", crate::activity_data::clean(note)))
+        .collect();
+    if hidden > 0 {
+        notes.push_str(&format!("+{hidden} extra ridges not shown · "));
+    }
+    notes
+}
+
+/// The live value, marked `▲` when it is above the channel's own band.
+fn live_text(channel: &Channel) -> String {
+    let Some(v) = channel.now else {
+        return String::new();
+    };
+    let mark = if channel.anomalous() { "▲" } else { "" };
+    format!("{mark}{}", channel.format(v))
+}
+
+/// An anomalous channel's label pulses between alarm red and near white.
+fn alert_tint(base: Rgb, channel: &Channel, pulse: bool) -> Rgb {
+    match (channel.anomalous(), pulse) {
+        (false, _) => base,
+        (true, true) => (255, 90, 70),
+        (true, false) => (255, 236, 205),
+    }
+}
+
+/// A half-second beat of the wall clock, so the pulse keeps time whether
+/// the view is flying or redrawing twice a second while it holds.
+fn pulse_on() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok_and(|d| d.as_millis() / 500 % 2 == 0)
+}
+
 /// Compact layout for narrow panes: one sparkline per channel.
-fn render_flat(channels: &[&Channel], dims: (usize, usize), bar: Option<&HostBar>) -> Vec<String> {
+fn render_flat(
+    channels: &[&Channel],
+    dims: (usize, usize),
+    bar: Option<&HostBar>,
+    apps: &[GpuApp],
+    notes: &str,
+) -> Vec<String> {
     let mut canvas = PixelCanvas::new(dims.0, dims.1, (10, 14, 22), (10, 14, 22));
     match bar {
         Some(bar) => {
@@ -758,17 +988,27 @@ fn render_flat(channels: &[&Channel], dims: (usize, usize), bar: Option<&HostBar
         }
         None => canvas.label(1, 0, "SYSTEMSCAPE  2h → now", (63, 235, 255)),
     }
-    // Wide panes give each slot several columns, so the chart fills the width.
-    let slots = dims.0.saturating_sub(21).min(HISTORY + 1);
-    let stride = (dims.0.saturating_sub(21) / (HISTORY + 1)).max(1);
     let shown = channels.len().min(dims.1.saturating_sub(2));
+    // Values start after the longest name shown; the chart 12 columns later.
+    let value_col = channels[..shown]
+        .iter()
+        .map(|c| sensors::columns(&c.label()) + 2)
+        .fold(8, usize::max);
+    let spark = value_col + 12;
+    // Wide panes give each slot several columns, so the chart fills the width.
+    let slots = dims.0.saturating_sub(spark + 1).min(HISTORY + 1);
+    let stride = (dims.0.saturating_sub(spark + 1) / (HISTORY + 1)).max(1);
+    let pulse = pulse_on();
     for (row, channel) in channels.iter().enumerate().take(shown) {
         let hue = channel.hue();
         let y = row as i64 + 1;
-        canvas.label(1, y, &channel.label(), hue);
-        if let Some(v) = channel.now {
-            canvas.label(8, y, &channel.format(v), mix(hue, (255, 255, 255), 0.35));
-        }
+        canvas.label(1, y, &channel.label(), alert_tint(hue, channel, pulse));
+        canvas.label(
+            value_col as i64,
+            y,
+            &live_text(channel),
+            mix(hue, (255, 255, 255), 0.35),
+        );
         let live = (!channel.slot_peak.is_nan()).then_some(channel.slot_peak);
         let values: Vec<f64> = channel.history.iter().copied().chain(live).collect();
         let start = values.len().saturating_sub(slots);
@@ -780,11 +1020,17 @@ fn render_flat(channels: &[&Channel], dims: (usize, usize), bar: Option<&HostBar
             let n = channel.norm(*v);
             let glyph = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'][(n * 7.0).round() as usize];
             canvas.label(
-                (20 + (pad + i) * stride) as i64,
+                (spark + (pad + i) * stride) as i64,
                 y,
                 &glyph.to_string().repeat(stride),
                 mix((40, 48, 62), hue, 0.35 + 0.65 * n),
             );
+        }
+        // Who holds the card's memory, when the pane has room after the chart.
+        if let (Kind::Vram, Some(card)) = (channel.kind, channel.gpu) {
+            let end = spark + slots * stride + 1;
+            let text = sensors::apps_text(apps, card, dims.0.saturating_sub(end + 1));
+            canvas.label(end as i64, y, &text, MUTED);
         }
     }
     let hidden = channels.len() - shown;
@@ -797,7 +1043,7 @@ fn render_flat(channels: &[&Channel], dims: (usize, usize), bar: Option<&HostBar
     canvas.label(
         1,
         dims.1 as i64 - 1,
-        &format!("{trouble}f 3D · {tab}q quit{more}"),
+        &format!("{trouble}{notes}f 3D · {tab}q quit{more}"),
         MUTED,
     );
     canvas.rows()
@@ -812,11 +1058,12 @@ fn render(
     flat: bool,
     bar: Option<&HostBar>,
 ) -> Vec<String> {
-    let visible: Vec<&Channel> = channels.iter().filter(|c| c.has_data()).collect();
+    let (visible, hidden) = drawable(channels);
+    let notes = status_notes(snapshot, hidden);
     // The 3D view needs one free text row per ridge label, plus header,
     // time ruler and status line.
     if flat || dims.0 < 80 || dims.1 < 20 || visible.len() + 3 > dims.1 {
-        return render_flat(&visible, dims, bar);
+        return render_flat(&visible, dims, bar, &snapshot.gpu_apps, &notes);
     }
     let mut canvas = PixelCanvas::new(dims.0, dims.1, SKY_TOP, SKY_HORIZON);
     let (width, height) = canvas.sample_dims();
@@ -902,12 +1149,28 @@ fn render(
         cell.1 = cell.1.max(above + 1);
         above = cell.1;
     }
+    let pulse = pulse_on();
     for (channel, (col, row)) in visible.iter().zip(cells) {
-        let value = channel.now.map(|v| channel.format(v)).unwrap_or_default();
-        let col = col.clamp(0, (columns - 8 - value.chars().count() as i64).max(0));
+        let name = channel.label();
+        let value = live_text(channel);
+        // Names longer than six columns push their value right.
+        let name_width = (sensors::columns(&name) as i64 + 1).max(7);
+        let value_width = sensors::columns(&value) as i64;
+        let col = col.clamp(0, (columns - name_width - 1 - value_width).max(0));
         let hue = mix(channel.hue(), (255, 255, 255), 0.18);
-        canvas.label(col, row, &channel.label(), hue);
-        canvas.label(col + 7, row, &value, mix(hue, (255, 255, 255), 0.4));
+        canvas.label(col, row, &name, alert_tint(hue, channel, pulse));
+        canvas.label(
+            col + name_width,
+            row,
+            &value,
+            mix(hue, (255, 255, 255), 0.4),
+        );
+        if let (Kind::Vram, Some(card)) = (channel.kind, channel.gpu) {
+            let at = col + name_width + value_width + 2;
+            let room = (columns - at - 1).max(0) as usize;
+            let text = sensors::apps_text(&snapshot.gpu_apps, card, room);
+            canvas.label(at, row, &text, MUTED);
+        }
     }
     canvas.label(1, 0, "SYSTEMSCAPE", (63, 235, 255));
     match bar {
@@ -936,7 +1199,7 @@ fn render(
         1,
         dims.1 as i64 - 1,
         &format!(
-            "{}{}{} · Space fly/hold · arrows steer · +/- zoom · 0 reset · f flat · {}q quit",
+            "{}{notes}{}{} · Space fly/hold · arrows steer · +/- zoom · 0 reset · f flat · {}q quit",
             bar.map(HostBar::trouble).unwrap_or_default(),
             extras.concat(),
             if camera.fly { "FLYING" } else { "HOLDING" },
@@ -952,6 +1215,8 @@ pub struct Options {
     pub demo: bool,
     /// An explicit hosts file; otherwise the default path is used if present.
     pub hosts: Option<std::path::PathBuf>,
+    /// Container and model-server sources, each opt-in by flag.
+    pub(crate) extras: sensors::Extras,
 }
 
 /// `--probe`: print one snapshot of this machine per line until stdout
@@ -963,6 +1228,7 @@ pub fn probe(interval: Duration, gpu_interval: Duration) -> std::io::Result<()> 
     let mut out = std::io::stdout().lock();
     let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
     let (mut cards, mut gpu_at): (Vec<Gpu>, Option<Instant>) = (Vec::new(), None);
+    let mut apps: Vec<GpuApp> = Vec::new();
     loop {
         let started = Instant::now();
         let due = gpu_at.is_none_or(|at| at.elapsed() >= gpu_interval);
@@ -970,8 +1236,10 @@ pub fn probe(interval: Duration, gpu_interval: Duration) -> std::io::Result<()> 
         if due {
             gpu_at = Some(started);
             cards = snapshot.gpus.clone();
+            apps = snapshot.gpu_apps.clone();
         } else {
             snapshot.gpus = cards.clone();
+            snapshot.gpu_apps = apps.clone();
         }
         // JSON has no NaN: an Option becomes null, but a bare list entry would not parse.
         snapshot.pkg.retain(|t| t.is_finite());
@@ -1021,7 +1289,9 @@ impl Source {
 
     fn apply(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
+        sensors::tidy(&mut self.snapshot);
         ensure_cards(&mut self.channels, self.snapshot.gpus.len());
+        ensure_extras(&mut self.channels, &self.snapshot.extra);
         poll_into_channels(&mut self.channels, &self.snapshot);
         self.last_seen = Some(Instant::now());
         self.link = Link::Live;
@@ -1132,8 +1402,16 @@ pub fn run(options: Options) -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel();
     // nvidia-smi takes tens of milliseconds; polling off-thread keeps frames even.
     let on_screen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Container and model-server polls, opt-in by flag, merged into each local
+    // snapshot; without a local source there is nothing to merge them into.
+    let extras = match local_name {
+        Some(_) => options.extras.clone(),
+        None => sensors::Extras::default(),
+    };
+    let feeds = sensors::Feeds::start(&extras, options.demo, on_screen.clone());
     let sensors = local_name.is_some().then(|| {
         let sensor_sight = on_screen.clone();
+        let merger = feeds.merger();
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
             let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
@@ -1144,10 +1422,9 @@ pub fn run(options: Options) -> std::io::Result<()> {
                 if gpus {
                     gpu_at = Some(Instant::now());
                 }
-                if tx
-                    .send(poll_sensors(&mut prev_cpu, &mut rates, gpus))
-                    .is_err()
-                {
+                let mut snapshot = poll_sensors(&mut prev_cpu, &mut rates, gpus);
+                merger.merge(&mut snapshot);
+                if tx.send(snapshot).is_err() {
                     break;
                 }
                 // `unpark` when the view comes back on screen cuts the wait short.
@@ -1159,6 +1436,7 @@ pub fn run(options: Options) -> std::io::Result<()> {
         if let Some(sensors) = &sensors {
             sensors.thread().unpark();
         }
+        feeds.wake();
     };
 
     let mut sources: Vec<Source> = Vec::new();
@@ -1734,5 +2012,244 @@ mod tests {
         assert_eq!(back.snapshot.gpus[0].util, None);
         assert_eq!(back.snapshot.mem_pct, None);
         assert_eq!(back.snapshot.net_mbps, Some(3.25));
+    }
+
+    #[test]
+    fn old_probe_lines_still_parse_and_new_fields_reach_the_current_reader() {
+        // A 0.4.0 probe line: no named readings, no GPU processes.
+        let old = r#"{"v":1,"snapshot":{"pkg":[55.0],"gpus":[{"temp":40.0,"util":3.0,"used_gib":1.0,"total_gib":24.0}],"mem_pct":41.0}}"#;
+        let snapshot = hosts::read_frame(old).unwrap().unwrap();
+        assert_eq!(snapshot.mem_pct, Some(41.0));
+        assert!(snapshot.extra.is_empty() && snapshot.gpu_apps.is_empty());
+
+        // This build's line, plus a field from some later build: still v1.
+        let new = serde_json::to_string(&hosts::Frame {
+            v: hosts::PROBE_VERSION,
+            snapshot: Snapshot {
+                extra: vec![Reading {
+                    name: "LLM tok".into(),
+                    unit: "/s".into(),
+                    value: Some(42.0),
+                    full: None,
+                    log: false,
+                }],
+                gpu_apps: vec![GpuApp {
+                    card: 1,
+                    pid: 3307,
+                    name: Some("llama-server".into()),
+                    mib: Some(31_400.0),
+                }],
+                notes: vec!["local only".into()],
+                ..Snapshot::default()
+            },
+        })
+        .unwrap();
+        assert!(!new.contains("local only"), "notes never go on the wire");
+        let later = new.replacen(r#""extra":"#, r#""from_the_future":[1,2],"extra":"#, 1);
+        for line in [&new, &later] {
+            let snapshot = hosts::read_frame(line).unwrap().unwrap();
+            assert_eq!(snapshot.extra[0].value, Some(42.0));
+            assert_eq!(snapshot.gpu_apps[0].name.as_deref(), Some("llama-server"));
+        }
+        assert_eq!(
+            hosts::PROBE_VERSION,
+            1,
+            "additive fields keep the protocol version"
+        );
+    }
+
+    #[test]
+    fn the_band_flags_only_a_clear_rise_above_enough_history() {
+        let mut channel = Channel::new(Kind::Load, None);
+        for i in 0..BAND_MIN_SLOTS - 1 {
+            channel.poll(40.0 + (i % 3) as f64);
+            channel.commit_slot();
+        }
+        channel.now = Some(95.0);
+        assert_eq!(channel.band(), None, "too few slots to judge");
+        assert!(!channel.anomalous());
+        channel.poll(41.0);
+        channel.commit_slot();
+        let (low, high) = channel.band().unwrap();
+        assert!(low < 0.4 && high > 0.42);
+        assert!(
+            high - 0.41 >= BAND_K * BAND_FLOOR - 0.01,
+            "a near-flat channel's band is floored"
+        );
+        channel.now = Some(48.0);
+        assert!(!channel.anomalous(), "noise within the floor is not news");
+        channel.now = Some(5.0);
+        assert!(!channel.anomalous(), "an instant below the peaks is normal");
+        channel.now = Some(95.0);
+        assert!(channel.anomalous());
+        channel.now = None;
+        assert!(!channel.anomalous());
+
+        // Gaps do not count as history.
+        let mut gappy = Channel::new(Kind::Load, None);
+        for i in 0..40 {
+            if i % 2 == 0 {
+                gappy.poll(40.0);
+            }
+            gappy.commit_slot();
+        }
+        gappy.now = Some(95.0);
+        assert!(gappy.anomalous(), "20 finite slots are enough");
+    }
+
+    #[test]
+    fn named_channels_come_and_go_and_survive_late_cards() {
+        let reading = |name: &str, value| Reading {
+            name: name.into(),
+            unit: "%".into(),
+            value: Some(value),
+            full: Some(100.0),
+            log: false,
+        };
+        let mut source = Source::new(String::new(), Feed::Local, 0);
+        source.apply(Snapshot {
+            extra: vec![reading("web cpu", 20.0)],
+            mem_pct: Some(30.0),
+            ..Snapshot::default()
+        });
+        for channel in &mut source.channels {
+            channel.commit_slot();
+        }
+        // A card appears; then a second container takes the first one's place.
+        source.apply(Snapshot {
+            extra: vec![reading("db cpu", 60.0)],
+            gpus: vec![Gpu::default()],
+            ..Snapshot::default()
+        });
+        let find = |source: &Source, name: &str| {
+            source
+                .channels
+                .iter()
+                .find(|c| c.label() == name)
+                .map(|c| (c.history.len(), c.now))
+        };
+        assert_eq!(
+            find(&source, "web cpu"),
+            Some((1, None)),
+            "kept for its history"
+        );
+        assert_eq!(
+            find(&source, "db cpu"),
+            Some((1, Some(60.0))),
+            "padded to align"
+        );
+        assert!(source.channels.iter().any(|c| c.kind == Kind::GpuTemp));
+        // Once its history has slid away, a silent channel is forgotten.
+        for _ in 0..HISTORY {
+            for channel in &mut source.channels {
+                channel.commit_slot();
+            }
+        }
+        source.apply(Snapshot {
+            extra: vec![reading("db cpu", 61.0)],
+            ..Snapshot::default()
+        });
+        assert_eq!(find(&source, "web cpu"), None);
+        // A flood of names is bounded.
+        source.apply(Snapshot {
+            extra: (0..40).map(|i| reading(&format!("c{i}"), 1.0)).collect(),
+            ..Snapshot::default()
+        });
+        let named = source
+            .channels
+            .iter()
+            .filter(|c| c.kind == Kind::Extra)
+            .count();
+        assert!(named <= MAX_EXTRA_CHANNELS, "{named}");
+    }
+
+    #[test]
+    fn extra_ridges_are_capped_labelled_and_an_anomaly_is_marked_at_any_size() {
+        let mut channels = channels_for(3);
+        let mut snapshot = Snapshot::default();
+        sensors::demo_live(&mut snapshot);
+        // More named readings than the view draws.
+        snapshot.extra.extend((0..6).map(|i| Reading {
+            name: format!("box{i} cpu"),
+            unit: "%".into(),
+            value: Some(10.0 * i as f64),
+            full: Some(5600.0),
+            log: true,
+        }));
+        sensors::tidy(&mut snapshot);
+        ensure_extras(&mut channels, &snapshot.extra);
+        demo_prefill(&mut channels);
+        poll_into_channels(&mut channels, &snapshot);
+        for channel in &mut channels {
+            if channel.now.is_none() {
+                let last = *channel.history.back().unwrap();
+                channel.poll(last);
+            }
+        }
+        let tok = channels.iter().find(|c| c.label() == "LLM tok").unwrap();
+        assert!(tok.anomalous(), "the demo's token rate leaves its band");
+        let (shown, hidden) = drawable(&channels);
+        assert_eq!(hidden, 2);
+        assert_eq!(
+            shown.iter().filter(|c| c.kind == Kind::Extra).count(),
+            MAX_EXTRA_RIDGES
+        );
+        for dims in [
+            (80, 24),
+            (100, 30),
+            (120, 40),
+            (165, 35),
+            (200, 65),
+            (512, 180),
+            (47, 27),
+        ] {
+            for flat in [false, true] {
+                let rows = render(
+                    &channels,
+                    &snapshot,
+                    &Camera::default(),
+                    0.4,
+                    dims,
+                    flat,
+                    None,
+                );
+                assert_eq!(rows.len(), dims.1);
+                let text = plain_text(&rows);
+                let status = text.lines().last().unwrap_or_default();
+                if dims.0 >= 80 {
+                    assert!(
+                        status.contains("+2 extra ridges not shown"),
+                        "{dims:?} {flat}\n{text}"
+                    );
+                }
+                let body = plain_text(&rows[1..rows.len() - 1]);
+                let unnamed: Vec<String> = shown
+                    .iter()
+                    .map(|c| c.label())
+                    .filter(|label| !body.contains(label.as_str()))
+                    .collect();
+                assert!(
+                    unnamed.is_empty() || status.contains("more channels"),
+                    "{dims:?} flat {flat}: unnamed {unnamed:?}\n{text}"
+                );
+                if body.contains("LLM tok") {
+                    assert!(body.contains("▲96/s"), "{dims:?} flat {flat}\n{text}");
+                }
+            }
+        }
+        let wide = plain_text(&render(
+            &channels,
+            &snapshot,
+            &Camera::default(),
+            0.4,
+            (200, 65),
+            false,
+            None,
+        ));
+        assert!(wide.contains("llama-server 31G"), "{wide}");
+        assert!(
+            wide.contains("pid 48213"),
+            "an unresolved process shows as its PID"
+        );
     }
 }
