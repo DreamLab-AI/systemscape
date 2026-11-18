@@ -22,6 +22,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
+use std::time::Duration;
 
 /// Playback speeds, in recorded seconds per second of viewing.
 const SPEEDS: [f64; 5] = [10.0, 60.0, 300.0, 900.0, 3600.0];
@@ -368,6 +369,28 @@ impl Default for CastOptions {
 /// with the usual source flags: an asciicast v2 recording of a replay of one
 /// day, written to standard output. No terminal is needed.
 pub fn cast(args: &[String]) -> io::Result<()> {
+    let (options, events, coverage, demo) = prepare(args)?;
+    let lines = recording(&events, &coverage, &options, demo, MAX_BYTES).map_err(invalid)?;
+    let mut out = io::stdout().lock();
+    let written = lines
+        .iter()
+        .try_for_each(|line| writeln!(out, "{line}"))
+        .and_then(|()| out.flush());
+    match written {
+        // The reader went away, as `| head` does: not an error.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
+}
+
+/// Longest wait for the history to drain before a cast is drawn.
+const DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
+/// The cast's options and the history it replays. One collector poll reads
+/// a bounded share of the tracked files, so a cast built from it would
+/// replay part of a day and miss older days entirely; the history is
+/// drained first, as `--summary` does, within `DRAIN_BUDGET`.
+fn prepare(args: &[String]) -> io::Result<(CastOptions, Vec<Event>, String, bool)> {
     let mut sources = SourceFlags::new();
     let mut options = CastOptions::default();
     let mut rest = args.iter().skip(1);
@@ -400,18 +423,8 @@ pub fn cast(args: &[String]) -> io::Result<()> {
     }
     let mut sources = sources.open();
     let demo = sources.demo();
-    let (events, coverage) = sources.load();
-    let lines = recording(&events, &coverage, &options, demo, MAX_BYTES).map_err(invalid)?;
-    let mut out = io::stdout().lock();
-    let written = lines
-        .iter()
-        .try_for_each(|line| writeln!(out, "{line}"))
-        .and_then(|()| out.flush());
-    match written {
-        // The reader went away, as `| head` does: not an error.
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        other => other,
-    }
+    let (events, coverage) = sources.load_drained(DRAIN_BUDGET);
+    Ok((options, events, coverage, demo))
 }
 
 /// `120x38`, within the sizes the live view draws.
@@ -921,6 +934,59 @@ mod tests {
                 .sum::<usize>(),
             floors
         );
+    }
+
+    #[test]
+    fn a_cast_reads_the_whole_history_not_one_polls_share() {
+        // Twelve transcripts of over a megabyte each, one prompt per day at
+        // the end of each: more than one poll's eight-megabyte read budget.
+        let root = std::env::temp_dir().join(format!("systemscape-cast-{}", std::process::id()));
+        let filler = serde_json::json!({"ignored": "x".repeat(1100)}).to_string() + "\n";
+        for i in 0..12 {
+            let prompt = serde_json::json!({
+                "timestamp": format!("2026-09-{:02}T12:00:00Z", i + 1),
+                "type": "user", "uuid": format!("u{i}"), "sessionId": format!("s{i}"),
+                "message": {"content": "hello"},
+            });
+            let path = root.join(format!(".claude/projects/p/{i}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, filler.repeat(1000) + &prompt.to_string() + "\n").unwrap();
+        }
+        let dir = root.to_string_lossy().into_owned();
+        let args: Vec<String> = [
+            "systemscape",
+            "--activity",
+            "--cast",
+            "--home",
+            &dir,
+            "--workspace",
+            &dir,
+            "--archive",
+            &format!("{dir}/archive"),
+            "--day",
+            "2026-09-01",
+            "--size",
+            "20x8",
+            "--length",
+            "1",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (options, events, coverage, demo) = prepare(&args).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!demo);
+        assert_eq!(days(&events).len(), 12, "every day read: {coverage}");
+        assert!(coverage.contains("0 files pending"), "{coverage}");
+        for day in days(&events) {
+            let options = CastOptions {
+                day: Some(day.to_owned()),
+                ..options.clone()
+            };
+            assert!(
+                recording(&events, &coverage, &options, demo, MAX_BYTES).is_ok(),
+                "{day}"
+            );
+        }
     }
 
     #[test]

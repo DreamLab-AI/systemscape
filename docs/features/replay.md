@@ -80,6 +80,11 @@ the result with `asciinema play city.cast`.
   byte cap is reached, the recording jumps straight to it.
 - It honours `--demo` and the usual source flags. With `--demo` no agent
   history is opened.
+- Before drawing, the cast reads the history until no tracked file has
+  unread bytes, as `--summary` does: one bounded poll reads only a share of a
+  large history, which would replay part of a day and miss older days. The
+  wait is capped at 3 seconds and ends early when a round reads nothing new;
+  anything still unread then shows as pending in the coverage line (`?`).
 
 **Recordings contain record text.** The renderer strips terminal controls and
 directional formatting, but it does not redact credentials typed into prompts
