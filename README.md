@@ -14,27 +14,50 @@ The repository was previously named `thermal3d`; the binary remains `systemscape
 
 These are captures of the running application in 200×65 tmux panes. Activity
 uses synthetic records; telemetry uses a synthetic history with live NOW readings.
+The red line at the top of some captures is the alert banner raised by the
+demo's built-in rules.
 
 **Agent work in 3D** — a city of recorded work. Each district is a project,
 each tower a session, each floor a recorded action coloured by what it was.
-The selected tower carries a callout; the strip below lists the most recent
-sessions and what each last did.
+The pink arc joins a session to the subagent it started, the red roads join
+sessions that edited the same file, and the grey outlines are the previous
+day's skyline. The selected tower carries a callout; the strip below lists the
+most recent sessions, with `↻` on one that keeps repeating a failing command.
 
-![Activity city: project districts, session towers and a most-recent strip](docs/activity-3d.png)
+![Activity city: districts, session towers, a delegation arc, shared-file roads and yesterday's outline](docs/activity-3d.png)
 
-**System telemetry** — one labelled ridge per channel, GPUs split per card,
-correlates temperatures, power, load, memory, GPU work, disk and network traffic.
+**Replay** — press `r` and the day is rebuilt record by record; `--activity
+--cast` writes the same replay as an asciinema recording.
 
-![System telemetry rendered as labelled 3D ridges, one hue per channel](docs/telemetry.png)
+![A replay of the demo day: towers grow as the cut-off time advances](docs/replay.gif)
 
-**Telemetry sparklines** — press `f`, or use a pane under 80 columns or 20 rows.
+![Replay paused part-way through the day, with the cut-off time in the header](docs/activity-replay.png)
 
-![Telemetry as one coloured sparkline per channel with live values](docs/telemetry-flat.png)
+**Heat** — press `e` to tint each floor by how busy the machine was when the
+record was made, from a history kept with `systemscape --record`.
+
+![The same city with floors tinted from blue to red by recorded machine load](docs/activity-heat.png)
 
 **Activity detail** — press Enter or `f`, or shrink the pane below 80 columns
 or 20 rows: every session of the day, then every record of the selected one.
 
 ![Activity detail: sessions table and the selected session's records](docs/activity-flat.png)
+
+**System telemetry** — one labelled ridge per channel, GPUs split per card,
+correlates temperatures, power, load, memory, GPU work, disk and network traffic.
+Marks along the front edge are recorded commits, errors and agent calls; the
+VRAM labels name the processes holding the memory, and `▲` flags a value above
+its usual band.
+
+![System telemetry as labelled 3D ridges with activity marks on the time axis](docs/telemetry.png)
+
+**Telemetry sparklines** — press `f`, or use a pane under 80 columns or 20 rows.
+
+![Telemetry as one coloured sparkline per channel, with an activity row beneath](docs/telemetry-flat.png)
+
+**Alerts** — rules from a TOML file raise the banner; `!` lists them.
+
+![The alert rule list over the activity city: two rules firing, one clear](docs/alerts.png)
 
 To reproduce these captures, see [screenshots](docs/SCREENSHOTS.md).
 
@@ -274,6 +297,17 @@ systemscape --mcp                       # read-only MCP server on stdio, for age
 systemscape --metrics 127.0.0.1:9108    # OpenMetrics endpoint, until interrupted
 ```
 
+A day's summary looks like this (`--activity --summary --demo`, shortened):
+
+```text
+Activity on 2026-11-18 (UTC): 4 projects · 8 sessions · 275 records · 63 edits · 20 errors · 3 commits
+STUCK      codex 77e385bc-demo in workspace/VisionFlow: "Bash cargo test --locked" failed 3 times running, last at 18:02
+CONTENDED  /workspace/agentbox/src/telemetry.rs edited by 3 sessions: archive:tester handoff-17, claude 9c2d4410-demo, claude a3f09e11-demo
+■ /workspace/VisionFlow  17:34–18:07  2 sessions · 63 tools · 17 edits · 8 errors · 0 commits
+  codex          01a1dc07-demo          17:34–18:07    7p   45t  11e   3✗  0c
+  codex          77e385bc-demo          17:47–18:02    3p   18t   6e   5✗  0c  STUCK
+```
+
 `--status` prints one short line and returns in about a tenth of a second,
 from a single bounded poll, so its counts can be low just after start-up. For
 a tmux status bar:
@@ -348,6 +382,20 @@ the frame rate within normal variation: 60 seconds with the probe ran at
 
 A host can name a local `command` instead of `ssh`, for any wrapper that
 prints probe lines, such as `docker exec -i NAME systemscape --probe`.
+
+## Feature guides
+
+Each newer feature has its own page with flags, keys, limits and what it does
+not claim:
+
+| Guide | Covers |
+|-------|--------|
+| [City links](docs/features/city.md) | delegation arcs, shared-file roads, the ghost skyline |
+| [Replay](docs/features/replay.md) | the `r` scrubber and `--activity --cast` |
+| [Join](docs/features/join.md) | activity marks on the time axis, `--record`, heat and machine-wide energy |
+| [Sensors](docs/features/sensors.md) | VRAM processes, `--containers`, `--llama-metrics`, the anomaly flag |
+| [Alerts](docs/features/alerts.md) | rule file format, notifications, tmux output |
+| [Insight](docs/features/insight.md) | `--status`, `--summary`, stuck sessions, `--mcp`, `--metrics` |
 
 ## Design
 
