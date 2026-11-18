@@ -6,12 +6,14 @@
 //! utilisation, VRAM). The camera sways and bobs but never orbits, so older is
 //! always left and NOW is always right.
 use crate::activity::{clip_scene, project};
+use crate::hosts::{self, Federation, Link, Remote, Report};
 use crate::pixels::{mix, PixelCanvas, Rgb};
 use crate::{
     ColChar, Colour, DisplayMode, Face, Mesh3D, Modifier, Transform3D, Vec2D, Vec3D, Viewport,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use gemini_engine::core::CanDraw;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::process::Command;
@@ -162,28 +164,32 @@ impl Channel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Gpu {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Gpu {
     temp: Option<f64>,
     util: Option<f64>,
     used_gib: Option<f64>,
     total_gib: Option<f64>,
 }
 
-/// One poll of every parameter we can read.
-#[derive(Clone, Default)]
-struct Snapshot {
-    pkg: Vec<f64>,
-    core_max: Option<f64>,
-    gpus: Vec<Gpu>,
-    nvme: Option<f64>,
-    pch: Option<f64>,
-    nic: Option<f64>,
-    power_w: Option<f64>,
-    cpu_pct: Option<f64>,
-    mem_pct: Option<f64>,
-    disk_mbps: Option<f64>,
-    net_mbps: Option<f64>,
+/// One poll of every parameter we can read. It is also the body of a probe
+/// line (`hosts::Frame`): every field is optional on the wire, so a probe and
+/// a viewer of different builds still agree on the fields they share.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Snapshot {
+    pub(crate) pkg: Vec<f64>,
+    pub(crate) core_max: Option<f64>,
+    pub(crate) gpus: Vec<Gpu>,
+    pub(crate) nvme: Option<f64>,
+    pub(crate) pch: Option<f64>,
+    pub(crate) nic: Option<f64>,
+    pub(crate) power_w: Option<f64>,
+    pub(crate) cpu_pct: Option<f64>,
+    pub(crate) mem_pct: Option<f64>,
+    pub(crate) disk_mbps: Option<f64>,
+    pub(crate) net_mbps: Option<f64>,
 }
 
 impl Snapshot {
@@ -221,6 +227,30 @@ struct RateState {
 
 fn read_f64(path: &str) -> Option<f64> {
     fs::read_to_string(path).ok()?.trim().parse::<f64>().ok()
+}
+
+/// Every `tempN_label` / `tempN_input` pair of one hwmon device, in °C.
+fn labelled_temps(base: &str) -> Vec<(String, f64)> {
+    (1..=16)
+        .filter_map(|i| {
+            let label = fs::read_to_string(format!("{base}/temp{i}_label")).ok()?;
+            let milli = read_f64(&format!("{base}/temp{i}_input"))?;
+            Some((label.trim().to_string(), milli / 1000.0))
+        })
+        .collect()
+}
+
+/// AMD `k10temp`: the hottest core die (`Tccd*`) when the driver lists them,
+/// else `Tdie`, else the control value `Tctl`, which can carry a fan offset.
+fn amd_cpu_temp(temps: &[(String, f64)]) -> Option<f64> {
+    let named = |name: &str| temps.iter().find(|(l, _)| l == name).map(|(_, t)| *t);
+    temps
+        .iter()
+        .filter(|(label, _)| label.starts_with("Tccd"))
+        .map(|(_, t)| *t)
+        .reduce(f64::max)
+        .or_else(|| named("Tdie"))
+        .or_else(|| named("Tctl"))
 }
 
 fn disk_bytes_from(stats: &str) -> u64 {
@@ -353,6 +383,7 @@ fn poll_sensors(prev_cpu: &mut (u64, u64), rates: &mut RateState, gpus: bool) ->
                         }
                     }
                 }
+                "k10temp" => s.pkg.extend(amd_cpu_temp(&labelled_temps(&base))),
                 "nvme" => s.nvme = temp1(),
                 "pch_lewisburg" => s.pch = temp1(),
                 "ixgbe" => s.nic = temp1(),
@@ -718,9 +749,15 @@ fn build_scene(
 }
 
 /// Compact layout for narrow panes: one sparkline per channel.
-fn render_flat(channels: &[&Channel], dims: (usize, usize)) -> Vec<String> {
+fn render_flat(channels: &[&Channel], dims: (usize, usize), bar: Option<&HostBar>) -> Vec<String> {
     let mut canvas = PixelCanvas::new(dims.0, dims.1, (10, 14, 22), (10, 14, 22));
-    canvas.label(1, 0, "SYSTEMSCAPE  2h → now", (63, 235, 255));
+    match bar {
+        Some(bar) => {
+            canvas.label(1, 0, "SYSTEMSCAPE", (63, 235, 255));
+            bar.draw(&mut canvas, 13, 0);
+        }
+        None => canvas.label(1, 0, "SYSTEMSCAPE  2h → now", (63, 235, 255)),
+    }
     // Wide panes give each slot several columns, so the chart fills the width.
     let slots = dims.0.saturating_sub(21).min(HISTORY + 1);
     let stride = (dims.0.saturating_sub(21) / (HISTORY + 1)).max(1);
@@ -756,7 +793,13 @@ fn render_flat(channels: &[&Channel], dims: (usize, usize)) -> Vec<String> {
     } else {
         String::new()
     };
-    canvas.label(1, dims.1 as i64 - 1, &format!("f 3D · q quit{more}"), MUTED);
+    let (trouble, tab) = bar.map_or((String::new(), ""), |bar| (bar.trouble(), "Tab host · "));
+    canvas.label(
+        1,
+        dims.1 as i64 - 1,
+        &format!("{trouble}f 3D · {tab}q quit{more}"),
+        MUTED,
+    );
     canvas.rows()
 }
 
@@ -767,12 +810,13 @@ fn render(
     scroll: f64,
     dims: (usize, usize),
     flat: bool,
+    bar: Option<&HostBar>,
 ) -> Vec<String> {
     let visible: Vec<&Channel> = channels.iter().filter(|c| c.has_data()).collect();
     // The 3D view needs one free text row per ridge label, plus header,
     // time ruler and status line.
     if flat || dims.0 < 80 || dims.1 < 20 || visible.len() + 3 > dims.1 {
-        return render_flat(&visible, dims);
+        return render_flat(&visible, dims, bar);
     }
     let mut canvas = PixelCanvas::new(dims.0, dims.1, SKY_TOP, SKY_HORIZON);
     let (width, height) = canvas.sample_dims();
@@ -866,12 +910,24 @@ fn render(
         canvas.label(col + 7, row, &value, mix(hue, (255, 255, 255), 0.4));
     }
     canvas.label(1, 0, "SYSTEMSCAPE", (63, 235, 255));
-    canvas.label(
-        14,
-        0,
-        "2h of 150s peaks · height + glow = value · IO/NET log scale",
-        MUTED,
-    );
+    match bar {
+        Some(bar) => {
+            bar.draw(&mut canvas, 13, 0);
+            // A host with nothing to draw yet says why in the middle of the scene.
+            if visible.is_empty() {
+                let note = bar.trouble();
+                let note = note.trim_end_matches(" · ");
+                let col = (dims.0 as i64 - note.chars().count() as i64) / 2;
+                canvas.label(col.max(1), dims.1 as i64 / 2, note, MUTED);
+            }
+        }
+        None => canvas.label(
+            14,
+            0,
+            "2h of 150s peaks · height + glow = value · IO/NET log scale",
+            MUTED,
+        ),
+    }
     let extras: Vec<String> = [("PCH", snapshot.pch), ("NIC", snapshot.nic)]
         .iter()
         .filter_map(|(name, v)| v.map(|v| format!("{name} {v:.0}°  ·  ")))
@@ -880,49 +936,250 @@ fn render(
         1,
         dims.1 as i64 - 1,
         &format!(
-            "{}{} · Space fly/hold · arrows steer · +/- zoom · 0 reset · f flat · q quit",
+            "{}{}{} · Space fly/hold · arrows steer · +/- zoom · 0 reset · f flat · {}q quit",
+            bar.map(HostBar::trouble).unwrap_or_default(),
             extras.concat(),
-            if camera.fly { "FLYING" } else { "HOLDING" }
+            if camera.fly { "FLYING" } else { "HOLDING" },
+            if bar.is_some() { "Tab host · " } else { "" },
         ),
         MUTED,
     );
     canvas.rows()
 }
 
-pub fn run(demo: bool) -> std::io::Result<()> {
+/// Telemetry options from the command line.
+pub struct Options {
+    pub demo: bool,
+    /// An explicit hosts file; otherwise the default path is used if present.
+    pub hosts: Option<std::path::PathBuf>,
+}
+
+/// `--probe`: print one snapshot of this machine per line until stdout
+/// closes. This is what a viewer on another machine runs over ssh. There is
+/// no screen here to tell whether anyone is looking, so the costly GPU query
+/// runs on its own, slower, fixed interval and the last cards are repeated.
+pub fn probe(interval: Duration, gpu_interval: Duration) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
+    let (mut cards, mut gpu_at): (Vec<Gpu>, Option<Instant>) = (Vec::new(), None);
+    loop {
+        let started = Instant::now();
+        let due = gpu_at.is_none_or(|at| at.elapsed() >= gpu_interval);
+        let mut snapshot = poll_sensors(&mut prev_cpu, &mut rates, due);
+        if due {
+            gpu_at = Some(started);
+            cards = snapshot.gpus.clone();
+        } else {
+            snapshot.gpus = cards.clone();
+        }
+        // JSON has no NaN: an Option becomes null, but a bare list entry would not parse.
+        snapshot.pkg.retain(|t| t.is_finite());
+        let frame = hosts::Frame {
+            v: hosts::PROBE_VERSION,
+            snapshot,
+        };
+        // A closed pipe (the viewer quit, ssh dropped) ends the probe.
+        writeln!(out, "{}", serde_json::to_string(&frame)?)?;
+        out.flush()?;
+        std::thread::sleep(interval.saturating_sub(started.elapsed()));
+    }
+}
+
+/// Where one host's readings come from.
+enum Feed {
+    /// This machine's sensor thread.
+    Local,
+    Remote(Remote),
+}
+
+/// One machine on screen or in the background: its ridges and its link.
+struct Source {
+    name: String,
+    feed: Feed,
+    channels: Vec<Channel>,
+    snapshot: Snapshot,
+    link: Link,
+    last_seen: Option<Instant>,
+}
+
+impl Source {
+    fn new(name: String, feed: Feed, cards: usize) -> Self {
+        let link = match feed {
+            Feed::Local => Link::Live,
+            Feed::Remote(_) => Link::Connecting,
+        };
+        Self {
+            name,
+            feed,
+            channels: channels_for(cards),
+            snapshot: Snapshot::default(),
+            link,
+            last_seen: None,
+        }
+    }
+
+    fn apply(&mut self, snapshot: Snapshot) {
+        self.snapshot = snapshot;
+        ensure_cards(&mut self.channels, self.snapshot.gpus.len());
+        poll_into_channels(&mut self.channels, &self.snapshot);
+        self.last_seen = Some(Instant::now());
+        self.link = Link::Live;
+    }
+
+    /// No current reading: clear live values. History keeps what it had and
+    /// later slots commit as gaps.
+    fn silence(&mut self) {
+        self.snapshot = Snapshot::default();
+        for channel in &mut self.channels {
+            channel.now = None;
+        }
+    }
+
+    /// File every report a remote worker has sent. Returns whether anything changed.
+    fn drain(&mut self) -> bool {
+        let Feed::Remote(remote) = &self.feed else {
+            return false;
+        };
+        let reports: Vec<Report> = remote.reports.try_iter().collect();
+        let changed = !reports.is_empty();
+        for report in reports {
+            match report {
+                Report::Frame(snapshot) => self.apply(*snapshot),
+                Report::Link(Link::Live) => {} // the next frame says so
+                Report::Link(link) => {
+                    self.link = link;
+                    self.silence();
+                }
+            }
+        }
+        changed
+    }
+
+    /// A live remote that has gone quiet for three intervals is stale: its
+    /// readings are cleared rather than shown as current.
+    fn check_stale(&mut self) -> bool {
+        let Feed::Remote(remote) = &self.feed else {
+            return false;
+        };
+        let limit = (remote.interval * 3).max(Duration::from_secs(6));
+        let quiet = self.last_seen.is_none_or(|at| at.elapsed() > limit);
+        if self.link == Link::Live && quiet {
+            self.link = Link::Stale;
+            self.silence();
+            return true;
+        }
+        false
+    }
+}
+
+/// The host strip: every machine, its link, and which one is on screen.
+struct HostBar<'a> {
+    hosts: Vec<(&'a str, &'a Link)>,
+    selected: usize,
+}
+
+impl HostBar<'_> {
+    fn link_colour(link: &Link) -> Rgb {
+        match link {
+            Link::Live => (110, 220, 110),
+            Link::Connecting => (240, 200, 90),
+            Link::Stale => (200, 150, 90),
+            Link::Down(_) => (255, 95, 95),
+        }
+    }
+
+    /// Draw the strip from `col` on `row`.
+    fn draw(&self, canvas: &mut PixelCanvas, mut col: i64, row: i64) {
+        for (i, (name, link)) in self.hosts.iter().enumerate() {
+            let selected = i == self.selected;
+            let marker = if selected { "▸" } else { " " };
+            canvas.label(col, row, marker, (63, 235, 255));
+            canvas.label(
+                col + 1,
+                row,
+                &link.glyph().to_string(),
+                Self::link_colour(link),
+            );
+            let tint = if selected { (235, 242, 250) } else { MUTED };
+            canvas.label(col + 3, row, name, tint);
+            col += 5 + name.chars().count() as i64;
+        }
+    }
+
+    /// The selected host's trouble, if any, for the status line.
+    fn trouble(&self) -> String {
+        match self.hosts.get(self.selected) {
+            Some((name, link)) if **link != Link::Live => format!("{name}: {} · ", link.describe()),
+            _ => String::new(),
+        }
+    }
+}
+
+pub fn run(options: Options) -> std::io::Result<()> {
+    let federation: Option<Federation> = if options.demo {
+        None // the demo is synthetic and never connects anywhere
+    } else {
+        hosts::load(options.hosts.as_deref()).map_err(std::io::Error::other)?
+    };
+    // Without a hosts file there is one unnamed source and no host strip:
+    // exactly the single-machine view.
+    let (local_name, remotes) = match federation {
+        None => (Some(String::new()), Vec::new()),
+        Some(f) => (f.local, f.hosts),
+    };
+
     let (tx, rx) = mpsc::channel();
     // nvidia-smi takes tens of milliseconds; polling off-thread keeps frames even.
     let on_screen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let sensor_sight = on_screen.clone();
-    let sensors = std::thread::spawn(move || {
-        use std::sync::atomic::Ordering;
-        let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
-        let mut gpu_at: Option<Instant> = None;
-        loop {
-            let gpus = sensor_sight.load(Ordering::Relaxed)
-                || gpu_at.is_none_or(|at| at.elapsed() >= BACKGROUND_GPU_POLL);
-            if gpus {
-                gpu_at = Some(Instant::now());
+    let sensors = local_name.is_some().then(|| {
+        let sensor_sight = on_screen.clone();
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
+            let mut gpu_at: Option<Instant> = None;
+            loop {
+                let gpus = sensor_sight.load(Ordering::Relaxed)
+                    || gpu_at.is_none_or(|at| at.elapsed() >= BACKGROUND_GPU_POLL);
+                if gpus {
+                    gpu_at = Some(Instant::now());
+                }
+                if tx
+                    .send(poll_sensors(&mut prev_cpu, &mut rates, gpus))
+                    .is_err()
+                {
+                    break;
+                }
+                // `unpark` when the view comes back on screen cuts the wait short.
+                std::thread::park_timeout(POLL);
             }
-            if tx
-                .send(poll_sensors(&mut prev_cpu, &mut rates, gpus))
-                .is_err()
-            {
-                break;
-            }
-            // `unpark` when the view comes back on screen cuts the wait short.
-            std::thread::park_timeout(POLL);
-        }
+        })
     });
-    // Start even if the first poll is slow; late cards join via `ensure_cards`.
-    let mut snapshot: Snapshot = rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
-    // Demo always shows the multi-GPU layout, even on a host without cards.
-    let mut channels = channels_for(if demo { 3 } else { 0 });
-    ensure_cards(&mut channels, snapshot.gpus.len());
-    poll_into_channels(&mut channels, &snapshot);
-    if demo {
-        demo_prefill(&mut channels);
+    let wake_sensors = || {
+        if let Some(sensors) = &sensors {
+            sensors.thread().unpark();
+        }
+    };
+
+    let mut sources: Vec<Source> = Vec::new();
+    if let Some(name) = local_name {
+        // Demo always shows the multi-GPU layout, even on a host without cards.
+        let mut local = Source::new(name, Feed::Local, if options.demo { 3 } else { 0 });
+        // Start even if the first poll is slow; late cards join via `ensure_cards`.
+        local.apply(rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default());
+        if options.demo {
+            demo_prefill(&mut local.channels);
+        }
+        sources.push(local);
     }
+    sources.extend(
+        remotes
+            .into_iter()
+            .map(|host| Source::new(host.name.clone(), Feed::Remote(Remote::spawn(host)), 0)),
+    );
+    let local = sources.iter().position(|s| matches!(s.feed, Feed::Local));
+    let federated = sources.len() > 1 || local.is_none();
+    let mut selected = 0usize;
 
     let _terminal = crate::Terminal::enter()?;
     let mut sight = crate::Sight::new();
@@ -937,15 +1194,20 @@ pub fn run(demo: bool) -> std::io::Result<()> {
     let mut drawn = Instant::now();
     loop {
         let frame_started = Instant::now();
-        while let Ok(fresh) = rx.try_recv() {
-            snapshot = fresh;
-            ensure_cards(&mut channels, snapshot.gpus.len());
-            poll_into_channels(&mut channels, &snapshot);
-            dirty = true;
+        if let Some(i) = local {
+            while let Ok(fresh) = rx.try_recv() {
+                sources[i].apply(fresh);
+                dirty |= i == selected;
+            }
+        }
+        for (i, source) in sources.iter_mut().enumerate() {
+            let changed = source.drain() | source.check_stale();
+            // A link change redraws the strip, whichever host it is.
+            dirty |= changed && (i == selected || federated);
         }
         if slot_started.elapsed().as_secs_f64() >= SLOT_SECS {
             slot_started += Duration::from_secs_f64(SLOT_SECS);
-            for channel in &mut channels {
+            for channel in sources.iter_mut().flat_map(|s| s.channels.iter_mut()) {
                 channel.commit_slot();
             }
             // The next slot starts empty: re-applying the last poll would
@@ -957,7 +1219,7 @@ pub fn run(demo: bool) -> std::io::Result<()> {
         if back || visible != on_screen.load(std::sync::atomic::Ordering::Relaxed) {
             on_screen.store(visible, std::sync::atomic::Ordering::Relaxed);
             if visible {
-                sensors.thread().unpark(); // fresh readings straight away
+                wake_sensors(); // fresh readings straight away
                 dirty = true;
             }
         }
@@ -975,8 +1237,21 @@ pub fn run(demo: bool) -> std::io::Result<()> {
             || visible && (flying || dirty || drawn.elapsed() >= Duration::from_millis(500))
         {
             let scroll = slot_started.elapsed().as_secs_f64() / SLOT_SECS;
+            let bar = federated.then(|| HostBar {
+                hosts: sources.iter().map(|s| (s.name.as_str(), &s.link)).collect(),
+                selected,
+            });
+            let shown = &sources[selected];
             buffer.present_rows(
-                render(&channels, &snapshot, &camera, scroll, dims, flat),
+                render(
+                    &shown.channels,
+                    &shown.snapshot,
+                    &camera,
+                    scroll,
+                    dims,
+                    flat,
+                    bar.as_ref(),
+                ),
                 dims,
             )?;
             dirty = false;
@@ -996,7 +1271,7 @@ pub fn run(demo: bool) -> std::io::Result<()> {
         if let Event::FocusGained | Event::FocusLost = input {
             if sight.focus(input == Event::FocusGained) {
                 on_screen.store(true, std::sync::atomic::Ordering::Relaxed);
-                sensors.thread().unpark();
+                wake_sensors();
             }
             dirty = true;
         }
@@ -1005,10 +1280,19 @@ pub fn run(demo: bool) -> std::io::Result<()> {
                 continue;
             }
             dirty = true;
+            let hosts = sources.len();
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(())
+                }
+                KeyCode::Tab => selected = (selected + 1) % hosts,
+                KeyCode::BackTab => selected = (selected + hosts - 1) % hosts,
+                KeyCode::Char(digit @ '1'..='9') => {
+                    let index = digit as usize - '1' as usize;
+                    if index < hosts {
+                        selected = index;
+                    }
                 }
                 KeyCode::Char(' ') => camera.fly = !camera.fly,
                 KeyCode::Left => camera.yaw = (camera.yaw - 0.08).max(-0.9),
@@ -1212,6 +1496,7 @@ mod tests {
                 scroll,
                 (165, 35),
                 false,
+                None,
             );
             assert_eq!(rows.len(), 35);
             assert_eq!(named(&rows, &channels), Vec::<String>::new());
@@ -1251,7 +1536,7 @@ mod tests {
                         dolly,
                         ..Camera::default()
                     };
-                    let rows = render(set, &snapshot, &camera, 0.3, dims, false);
+                    let rows = render(set, &snapshot, &camera, 0.3, dims, false, None);
                     assert_eq!(rows.len(), dims.1);
                     let missing = named(&rows, set);
                     assert!(
@@ -1263,7 +1548,16 @@ mod tests {
         }
         for dims in [(1, 1), (30, 8), (47, 27)] {
             assert_eq!(
-                render(&channels, &snapshot, &Camera::default(), 0.3, dims, false).len(),
+                render(
+                    &channels,
+                    &snapshot,
+                    &Camera::default(),
+                    0.3,
+                    dims,
+                    false,
+                    None
+                )
+                .len(),
                 dims.1
             );
         }
@@ -1274,8 +1568,171 @@ mod tests {
             0.3,
             (47, 27),
             false,
+            None,
         ));
         assert!(flat.contains("GPU1%") && flat.contains('▁'));
-        render(&[], &snapshot, &Camera::default(), 0.0, (165, 35), false);
+        render(
+            &[],
+            &snapshot,
+            &Camera::default(),
+            0.0,
+            (165, 35),
+            false,
+            None,
+        );
+    }
+
+    fn plain_text(rows: &[String]) -> String {
+        let mut text = String::new();
+        for row in rows {
+            let mut escape = false;
+            for c in row.chars() {
+                match (escape, c) {
+                    (false, '\x1b') => escape = true,
+                    (true, 'm') => escape = false,
+                    (false, _) => text.push(c),
+                    _ => {}
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn amd_cpu_temperature_prefers_core_dies_over_the_control_value() {
+        let t = |pairs: &[(&str, f64)]| {
+            amd_cpu_temp(
+                &pairs
+                    .iter()
+                    .map(|(l, v)| (l.to_string(), *v))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            t(&[("Tctl", 70.0), ("Tccd1", 61.0), ("Tccd2", 64.5)]),
+            Some(64.5)
+        );
+        assert_eq!(t(&[("Tctl", 80.0), ("Tdie", 70.0)]), Some(70.0));
+        assert_eq!(t(&[("Tctl", 55.0)]), Some(55.0));
+        assert_eq!(t(&[]), None);
+    }
+
+    #[test]
+    fn the_host_strip_names_every_host_and_explains_an_empty_one() {
+        let (live, down) = (
+            Link::Live,
+            Link::Down("ssh failed: Permission denied".into()),
+        );
+        let bar = HostBar {
+            hosts: vec![("here", &live), ("lab", &down)],
+            selected: 1,
+        };
+        let empty = channels_for(0);
+        for (dims, flat) in [((165, 35), false), ((60, 16), false), ((165, 35), true)] {
+            let text = plain_text(&render(
+                &empty,
+                &Snapshot::default(),
+                &Camera::default(),
+                0.0,
+                dims,
+                flat,
+                Some(&bar),
+            ));
+            assert!(
+                text.contains("● here") && text.contains("▸! lab"),
+                "{dims:?}\n{text}"
+            );
+            assert!(
+                text.contains("lab: ssh failed: Permission denied"),
+                "{dims:?}"
+            );
+            assert!(text.contains("Tab host"));
+        }
+        // A healthy selected host shows no trouble text, and no strip without a bar.
+        let mut channels = channels_for(1);
+        demo_prefill(&mut channels);
+        let healthy = HostBar {
+            hosts: vec![("here", &live), ("lab", &down)],
+            selected: 0,
+        };
+        let text = plain_text(&render(
+            &channels,
+            &Snapshot::default(),
+            &Camera::default(),
+            0.0,
+            (165, 35),
+            false,
+            Some(&healthy),
+        ));
+        assert!(!text.contains("here:") && !text.contains("lab:"));
+        let alone = plain_text(&render(
+            &channels,
+            &Snapshot::default(),
+            &Camera::default(),
+            0.0,
+            (165, 35),
+            false,
+            None,
+        ));
+        assert!(!alone.contains("Tab host") && alone.contains("height + glow"));
+    }
+
+    #[test]
+    fn a_quiet_remote_turns_stale_and_stops_showing_old_readings() {
+        let host = hosts::Host {
+            name: "quiet".into(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo '{\"v\":1,\"snapshot\":{\"mem_pct\":55}}'; sleep 30".into(),
+            ],
+            interval: Duration::from_millis(500),
+        };
+        let mut source = Source::new("quiet".into(), Feed::Remote(Remote::spawn(host)), 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while source.snapshot.mem_pct.is_none() && Instant::now() < deadline {
+            source.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(source.link, Link::Live);
+        let mem = |s: &Source| s.channels.iter().find(|c| c.kind == Kind::Mem).unwrap().now;
+        assert_eq!(mem(&source), Some(55.0));
+        assert!(!source.check_stale(), "fresh readings are not stale");
+        source.last_seen = Some(Instant::now() - Duration::from_secs(7));
+        assert!(source.check_stale());
+        assert_eq!(source.link, Link::Stale);
+        assert_eq!(mem(&source), None, "a stale host shows no live value");
+        assert!(
+            source.channels.iter().any(Channel::has_data),
+            "history is kept"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_survives_the_probe_wire() {
+        let snapshot = Snapshot {
+            pkg: vec![61.5],
+            gpus: vec![Gpu {
+                temp: Some(67.0),
+                util: None,
+                used_gib: Some(22.5),
+                total_gib: Some(24.0),
+            }],
+            mem_pct: Some(f64::NAN), // JSON has no NaN: it arrives as no reading
+            net_mbps: Some(3.25),
+            ..Snapshot::default()
+        };
+        let line = serde_json::to_string(&hosts::Frame {
+            v: hosts::PROBE_VERSION,
+            snapshot,
+        })
+        .unwrap();
+        let back: hosts::Frame = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.snapshot.pkg, vec![61.5]);
+        assert_eq!(back.snapshot.gpus[0].used_gib, Some(22.5));
+        assert_eq!(back.snapshot.gpus[0].util, None);
+        assert_eq!(back.snapshot.mem_pct, None);
+        assert_eq!(back.snapshot.net_mbps, Some(3.25));
     }
 }

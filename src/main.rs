@@ -1,6 +1,7 @@
 //! SystemScape — 3D system telemetry and agent work history in the terminal.
 //!
-//! `telemetry` draws one labelled ridge per channel over a two-hour window;
+//! `telemetry` draws one labelled ridge per channel over a two-hour window,
+//! for this machine and any listed in a hosts file (`hosts`);
 //! `activity` draws recorded agent work as a city of sessions. This module owns the terminal guard,
 //! the row-diffing frame buffer and the helpers both views share.
 
@@ -11,6 +12,7 @@ pub(crate) use gemini_engine::{
 };
 mod activity;
 mod activity_data;
+mod hosts;
 mod pixels;
 mod telemetry;
 
@@ -179,10 +181,69 @@ impl FrameBuffer {
     }
 }
 
+/// What a telemetry command line asks for.
+#[derive(Debug, PartialEq)]
+enum TelemetryMode {
+    View {
+        demo: bool,
+        hosts: Option<std::path::PathBuf>,
+    },
+    Probe {
+        interval: std::time::Duration,
+        gpu_interval: std::time::Duration,
+    },
+}
+
+/// Parse the telemetry options (everything except `--activity` runs).
+fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
+    let (mut demo, mut probe, mut hosts) = (false, false, None);
+    let (mut interval, mut gpu_interval) = (None, None);
+    let mut rest = args.iter().skip(1);
+    let seconds = |flag: &str, value: Option<&String>| -> Result<f64, String> {
+        value
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.5..=600.0).contains(v))
+            .ok_or_else(|| format!("{flag} needs a number of seconds from 0.5 to 600"))
+    };
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--demo" => demo = true,
+            "--probe" => probe = true,
+            "--hosts" => {
+                let path = rest.next().ok_or("--hosts needs a file path")?;
+                hosts = Some(std::path::PathBuf::from(path));
+            }
+            "--interval" => interval = Some(seconds(arg, rest.next())?),
+            "--gpu-interval" => gpu_interval = Some(seconds(arg, rest.next())?),
+            other => return Err(format!("unknown telemetry option {other}; see --help")),
+        }
+    }
+    if probe {
+        if demo || hosts.is_some() {
+            return Err("--probe takes only --interval and --gpu-interval".into());
+        }
+        let interval = interval.unwrap_or(2.0);
+        let gpu_interval = gpu_interval.unwrap_or(10.0).max(interval);
+        return Ok(TelemetryMode::Probe {
+            interval: std::time::Duration::from_secs_f64(interval),
+            gpu_interval: std::time::Duration::from_secs_f64(gpu_interval),
+        });
+    }
+    if interval.is_some() || gpu_interval.is_some() {
+        return Err(
+            "--interval and --gpu-interval apply to --probe; set a host's in its hosts file".into(),
+        );
+    }
+    if demo && hosts.is_some() {
+        return Err("--demo is synthetic and cannot be combined with --hosts".into());
+    }
+    Ok(TelemetryMode::View { demo, hosts })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("systemscape {}\n\nUsage: systemscape [--demo]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.\n           Space holds/resumes flight, arrows steer, +/- zoom, 0 reset, f flat view, q quits.\nActivity: a city of recorded work. District = project, tower = session, floor = action.\n          Space follows live work or holds, j/k session, Enter or f detail view (j/k record,\n          Enter source), [/] day, arrows steer, +/- zoom, 0 reset, h strip, ? sources, q quits.\nBoth views pause while their tmux window is not on screen, and slow down while visible but unfocused.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
+        println!("systemscape {}\n\nUsage: systemscape [--demo | --hosts FILE]\n       systemscape --probe [--interval SECS] [--gpu-interval SECS]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.\n           Space holds/resumes flight, arrows steer, +/- zoom, 0 reset, f flat view, q quits.\n           With a hosts file, other machines appear too: Tab or 1-9 picks the host shown.\nActivity: a city of recorded work. District = project, tower = session, floor = action.\n          Space follows live work or holds, j/k session, Enter or f detail view (j/k record,\n          Enter source), [/] day, arrows steer, +/- zoom, 0 reset, h strip, ? sources, q quits.\nBoth views pause while their tmux window is not on screen, and slow down while visible but unfocused.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --hosts    hosts file to watch (default $XDG_CONFIG_HOME/systemscape/hosts.toml, if present)\n  --probe    print this machine's readings as JSON lines, for a viewer elsewhere\n  --interval / --gpu-interval  probe sensor and nvidia-smi periods (default 2 and 10 s)\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -196,11 +257,24 @@ fn main() {
         }
         return;
     }
-    if let Some(arg) = args.iter().skip(1).find(|a| a.as_str() != "--demo") {
-        eprintln!("systemscape: unknown telemetry option {arg}; see --help");
-        std::process::exit(2);
-    }
-    if let Err(error) = telemetry::run(args.iter().any(|a| a == "--demo")) {
+    let result = match telemetry_mode(&args) {
+        Err(error) => {
+            eprintln!("systemscape: {error}");
+            std::process::exit(2);
+        }
+        Ok(TelemetryMode::Probe {
+            interval,
+            gpu_interval,
+        }) => match telemetry::probe(interval, gpu_interval) {
+            // The viewer went away: that is how a probe is meant to end.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        },
+        Ok(TelemetryMode::View { demo, hosts }) => {
+            telemetry::run(telemetry::Options { demo, hosts })
+        }
+    };
+    if let Err(error) = result {
         eprintln!("systemscape: {error}");
         std::process::exit(1);
     }
@@ -224,5 +298,58 @@ mod tests {
         );
         assert_eq!(parse("1 1 0"), Some((false, false)), "no client attached");
         assert_eq!(parse("garbage"), None);
+    }
+
+    #[test]
+    fn telemetry_flags_parse_and_conflicts_are_refused() {
+        use super::{telemetry_mode as mode, TelemetryMode};
+        use std::time::Duration;
+        let argv = |line: &str| {
+            std::iter::once("systemscape")
+                .chain(line.split_whitespace())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mode(&argv("")),
+            Ok(TelemetryMode::View {
+                demo: false,
+                hosts: None
+            })
+        );
+        assert_eq!(
+            mode(&argv("--hosts /etc/h.toml")),
+            Ok(TelemetryMode::View {
+                demo: false,
+                hosts: Some("/etc/h.toml".into())
+            })
+        );
+        assert_eq!(
+            mode(&argv("--probe --interval 5")),
+            Ok(TelemetryMode::Probe {
+                interval: Duration::from_secs(5),
+                gpu_interval: Duration::from_secs(10)
+            })
+        );
+        assert_eq!(
+            mode(&argv("--probe --interval 20 --gpu-interval 3")),
+            Ok(TelemetryMode::Probe {
+                interval: Duration::from_secs(20),
+                gpu_interval: Duration::from_secs(20)
+            }),
+            "the GPU is never asked more often than the sensors"
+        );
+        for bad in [
+            "--hosts",
+            "--probe --demo",
+            "--probe --hosts x",
+            "--interval 2",
+            "--demo --hosts x",
+            "--probe --interval 0",
+            "--probe --interval soon",
+            "--bogus",
+        ] {
+            assert!(mode(&argv(bad)).is_err(), "{bad} should be refused");
+        }
     }
 }

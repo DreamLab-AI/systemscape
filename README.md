@@ -2,6 +2,9 @@
 
 **Interactive 3D system telemetry and agent work history for your terminal.**
 
+Telemetry can cover several machines at once: list them in a hosts file and
+SystemScape reads each one's sensors over SSH (see [Other machines](#other-machines)).
+
 SystemScape has two views: hardware telemetry shows what changed together;
 agent activity shows who worked on what, with selectable records and their sources.
 Both use [gemini-engine](https://github.com/renpenguin/gemini-engine) and run locally.
@@ -167,7 +170,7 @@ Front to back:
 
 | Ridge | Source | Scale |
 |-------|--------|-------|
-| CPU° | `coretemp` hwmon, hottest package or core across sockets | 25–95 °C |
+| CPU° | `coretemp` hwmon, hottest package or core across sockets; AMD `k10temp` hottest core die, else `Tdie`, else `Tctl` | 25–95 °C |
 | GPU*n*° | `nvidia-smi`, one ridge per card | 25–90 °C |
 | DISK° | `nvme` hwmon composite | 25–75 °C |
 | PWR | ACPI `power_meter`, whole-system watts | 0–900 W |
@@ -182,6 +185,68 @@ Cards of one kind are shades of that kind's hue and sit closer together than
 different kinds. The status line additionally reports PCH and NIC (`ixgbe`)
 temperatures. Missing sources degrade gracefully: a ridge with no data does
 not appear, and a host without `nvidia-smi` shows no GPU ridges.
+
+## Other machines
+
+A hosts file adds other machines to the telemetry view. Each one runs
+`systemscape --probe`, which prints one JSON line of that machine's readings
+every interval, and SystemScape reads those lines over the system OpenSSH
+client. Every machine keeps its own two-hour history from the moment the view
+starts, so switching between them never shows a gap.
+
+```sh
+cp docs/hosts.example.toml ~/.config/systemscape/hosts.toml   # then edit it
+systemscape                         # this machine plus the listed hosts
+systemscape --hosts ./lab.toml      # a different file
+```
+
+The default file is `$XDG_CONFIG_HOME/systemscape/hosts.toml`, else
+`~/.config/systemscape/hosts.toml`. Without it SystemScape shows only the
+machine it runs on, exactly as before; a file named with `--hosts` must exist.
+[`docs/hosts.example.toml`](docs/hosts.example.toml) documents every field.
+
+```toml
+[[host]]
+name = "render-box"
+ssh = "user@render-box.example"
+probe = "/home/user/.local/bin/systemscape"
+```
+
+Install the same SystemScape version on each machine and point `probe` at it.
+The probe needs no terminal, configuration or privileges, and reads the same
+sources as the local view. It exits as soon as nobody reads its output, so
+quitting the viewer or losing the connection leaves nothing running.
+
+**Credentials stay with OpenSSH.** The hosts file holds no secret. SystemScape
+runs `ssh` with arguments, never through a local shell, with `BatchMode` (it
+never prompts), a five-second connect timeout and keep-alives that drop a dead
+link within about fifteen seconds. Keys, agents, jump hosts and host-key
+checking come from your `~/.ssh/config`; a host that needs a password or an
+unknown host key is shown as failed, with SSH's reason. The probe path and
+destination are checked before use, because the remote login shell runs the
+command.
+
+**The host strip.** The top line lists every machine: `●` live, `◌`
+connecting, `○` connected but silent for three intervals (its live values are
+cleared and new slots stay empty), `!` not running, with the reason on the
+status line, for example `probe not found (exit 127)` or `ssh failed:
+Permission denied (publickey).`. A failed host is retried with backoff up to
+a minute. Tab and Shift-Tab, or `1`–`9`, choose the machine on screen.
+
+A probe of a different protocol version is reported as incompatible and not
+read. Fields one version does not know are ignored, and fields it lacks show
+as no reading, so viewers and probes of nearby versions still agree.
+
+**Probe cost.** The GPU query is the expensive part, so a probe asks
+`nvidia-smi` every `gpu_interval` seconds (default 10) and repeats the last
+card readings in between; other sensors are read every `interval` (default 2).
+On a workstation driving a VR headset at 90 Hz, a probe at the defaults left
+the frame rate within normal variation: 60 seconds with the probe ran at
+82–91 fps (23% of seconds at 87 or below), 120 seconds without it at 81–91 fps
+(38%). If a host does stutter, raise its `gpu_interval`.
+
+A host can name a local `command` instead of `ssh`, for any wrapper that
+prints probe lines, such as `docker exec -i NAME systemscape --probe`.
 
 ## Design
 
@@ -205,6 +270,8 @@ not appear, and a host without `nvidia-smi` shows no GPU ridges.
 cargo build --release
 ./target/release/systemscape          # live telemetry
 ./target/release/systemscape --demo   # prefill 2 h of synthetic, correlated data
+./target/release/systemscape --hosts hosts.toml   # this machine plus other hosts
+./target/release/systemscape --probe  # JSON lines for a viewer on another machine
 ./target/release/systemscape --activity
 ```
 
@@ -225,6 +292,7 @@ useful for checking the full visual without waiting two hours.
 | `+` / `-` | Zoom |
 | `0` | Reset the camera |
 | `f` | Switch between sparklines and 3D |
+| Tab / Shift-Tab, `1`–`9` | Next / previous machine, or machine *n* (with a hosts file) |
 | `q`, Escape, Ctrl-C | Quit and restore the terminal |
 
 ## tmux integration
@@ -250,6 +318,12 @@ from container-visible `/proc/diskstats` and `/proc/net/dev` counters.
 [DreamLab Agentbox](https://github.com/DreamLab-AI/agentbox) bakes SystemScape
 into its Nix-built runtime. The System pane starts zoomed to the ridges; tmux prefix then `z` reveals
 `btm` alongside for live attribution; the Activity window runs `systemscape --activity`.
+Agentbox mounts an operator's hosts file read-only and links it to the default
+path, so the System pane shows other machines without extra flags.
+
+Inside a container, the viewer needs an `ssh` client and a key the remote host
+accepts; the probe on the remote host runs outside any container and sees that
+machine's sensors directly.
 
 ## Tuning
 
@@ -261,7 +335,7 @@ Telemetry settings are constants at the top of `src/telemetry.rs`:
 | `HISTORY` | slots per ridge | 48 |
 | `RELIEF` | world height of a full-scale value | 5.0 |
 | `FOV` | lens angle in degrees; lower keeps rows evenly spaced | 48 |
-| `POLL` | interval between sensor polls | 2 s |
+| `POLL` | interval between local sensor polls (remote hosts: `interval` in the hosts file) | 2 s |
 | `FRAME_MS` | frame budget | 55 (~18 FPS) |
 
 Channel scales and hues are in `Channel::norm` and `Channel::hue`; the flight

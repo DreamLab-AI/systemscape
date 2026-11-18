@@ -2,6 +2,7 @@
 """Exercise the release binary in an isolated real tmux terminal."""
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -128,6 +129,35 @@ try:
     tmux('send-keys', '-t', 'test:0', 'q')
     time.sleep(0.3)
     assert subprocess.run(['tmux', '-L', socket, 'has-session', '-t', 'test'], capture_output=True).returncode != 0
-    print('PASS: activity city, session select, detail list, source, small-pane list; telemetry ridges, labels, hold and narrow sparklines; both views idle off screen, keep updating in a visible split pane, and resume; tiny resize and quit')
+    client.terminate()
+
+    # Federated hosts without ssh: one host runs this build's probe locally,
+    # the other names a probe that does not exist.
+    hosts_file = Path(tempfile.mkdtemp(prefix='systemscape-smoke-')) / 'hosts.toml'
+    hosts_file.write_text(
+        'local_name = "here"\n'
+        '[[host]]\nname = "probe"\n'
+        f'command = ["{binary}", "--probe", "--interval", "0.5"]\n'
+        '[[host]]\nname = "ghost"\ncommand = ["/nonexistent/systemscape", "--probe"]\n')
+    client = start(f'{binary} --hosts {hosts_file}')
+    time.sleep(2.5)
+    strip = capture()
+    for expected in ('▸● here', '● probe', '! ghost', 'Tab host'):
+        assert expected in strip, f'host strip missing: {expected}'
+    tmux('send-keys', '-t', 'test:0', 'Tab')
+    time.sleep(0.6)
+    remote = capture()
+    assert '▸● probe' in remote and ('LOAD' in remote or 'MEM' in remote), 'probe host shows its ridges'
+    assert '--probe' in subprocess.run(['pgrep', '-af', f'{binary} --probe'], capture_output=True, text=True).stdout
+    tmux('send-keys', '-t', 'test:0', '3')
+    time.sleep(0.4)
+    ghost = capture()
+    assert '▸! ghost' in ghost and 'ghost: cannot start /nonexistent/systemscape' in ghost
+    tmux('send-keys', '-t', 'test:0', 'q')
+    time.sleep(0.6)
+    assert subprocess.run(['tmux', '-L', socket, 'has-session', '-t', 'test'], capture_output=True).returncode != 0
+    left = subprocess.run(['pgrep', '-af', f'{binary} --probe'], capture_output=True, text=True).stdout
+    assert left.strip() == '', f'quit left a probe running: {left}'
+    print('PASS: activity city, session select, detail list, source, small-pane list; telemetry ridges, labels, hold and narrow sparklines; both views idle off screen, keep updating in a visible split pane, and resume; host strip, probe host, missing-probe status, no probe left after quit; tiny resize and quit')
 finally:
     tmux('kill-server', check=False)

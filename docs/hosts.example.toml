@@ -1,0 +1,32 @@
+# SystemScape hosts file.
+#
+# Copy to ~/.config/systemscape/hosts.toml (or $XDG_CONFIG_HOME/systemscape/hosts.toml)
+# to watch other machines beside this one, or pass it with --hosts FILE.
+# Without this file SystemScape shows only the machine it runs on.
+#
+# Each host runs `systemscape --probe` over your system OpenSSH client.
+# Nothing here is a secret: keys, agents, jump hosts and host-key checking
+# stay in OpenSSH's hands (~/.ssh/config, ssh-agent). SSH never prompts
+# (BatchMode), so the key must already be usable without a password prompt.
+
+# Show this machine too (default true), and what to call it (default: hostname).
+local = true
+# local_name = "workstation"
+
+[[host]]
+name = "render-box"                # 1-16 characters, shown in the host strip
+ssh = "user@render-box.example"    # destination, or an alias from ~/.ssh/config
+# port = 22
+# identity_file = "~/.ssh/id_ed25519"
+# ssh_options = ["ProxyJump=bastion.example"]
+# Absolute path of the probe on that machine (default: `systemscape` on its PATH).
+# Plain path characters only: it is run by the remote login shell.
+probe = "/home/user/.local/bin/systemscape"
+interval = 2          # seconds between readings (0.5-60)
+gpu_interval = 10     # seconds between nvidia-smi queries (at least interval)
+
+# A host can instead run any local command that prints probe lines, which is
+# useful for a container or a wrapper of your own:
+# [[host]]
+# name = "sidecar"
+# command = ["docker", "exec", "-i", "sidecar", "systemscape", "--probe"]
