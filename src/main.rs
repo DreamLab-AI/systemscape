@@ -232,7 +232,7 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
     }
     if probe {
         if demo || hosts.is_some() || extras != sensors::Extras::default() {
-            return Err("--probe takes only --interval and --gpu-interval".into());
+            return Err("--probe takes only --interval, --gpu-interval and --record".into());
         }
         let interval = interval.unwrap_or(2.0);
         let gpu_interval = gpu_interval.unwrap_or(10.0).max(interval);
@@ -292,6 +292,13 @@ fn main() {
         }
         return;
     }
+    let (args, join) = match telemetry::join::split_flags(&args) {
+        Ok(split) => split,
+        Err(error) => {
+            eprintln!("systemscape: {error}");
+            std::process::exit(2);
+        }
+    };
     let result = match telemetry_mode(&args) {
         Err(error) => {
             eprintln!("systemscape: {error}");
@@ -300,7 +307,7 @@ fn main() {
         Ok(TelemetryMode::Probe {
             interval,
             gpu_interval,
-        }) => match telemetry::probe(interval, gpu_interval) {
+        }) => match telemetry::probe(interval, gpu_interval, join.record) {
             // The viewer went away: that is how a probe is meant to end.
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             other => other,
@@ -313,6 +320,7 @@ fn main() {
             demo,
             hosts,
             extras,
+            join,
         }),
     };
     if let Err(error) = result {

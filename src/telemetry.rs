@@ -21,6 +21,9 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+pub(crate) mod join;
+pub(crate) mod record;
+
 const FRAME_MS: u64 = 55; // ~18 FPS
 const POLL: Duration = Duration::from_secs(2);
 /// GPU query interval while the view is off screen. The cheap /proc and hwmon
@@ -983,6 +986,7 @@ fn render_flat(
     bar: Option<&HostBar>,
     apps: &[GpuApp],
     notes: &str,
+    marks: Option<&crate::activity::marks::TimeMarks>,
 ) -> Vec<String> {
     let mut canvas = PixelCanvas::new(dims.0, dims.1, (10, 14, 22), (10, 14, 22));
     match bar {
@@ -1037,6 +1041,15 @@ fn render_flat(
             canvas.label(end as i64, y, &text, MUTED);
         }
     }
+    if let Some(marks) = marks {
+        join::flat(
+            &mut canvas,
+            marks,
+            shown as i64 + 1,
+            (spark, slots, stride),
+            dims,
+        );
+    }
     let hidden = channels.len() - shown;
     let more = if hidden > 0 {
         format!(" · +{hidden} more channels in a taller pane")
@@ -1053,6 +1066,7 @@ fn render_flat(
     canvas.rows()
 }
 
+#[cfg(test)]
 fn render(
     channels: &[Channel],
     snapshot: &Snapshot,
@@ -1062,12 +1076,27 @@ fn render(
     flat: bool,
     bar: Option<&HostBar>,
 ) -> Vec<String> {
+    render_marked(channels, snapshot, camera, scroll, dims, flat, bar, None)
+}
+
+/// The view, with this machine's activity marks on the time axis when given.
+#[allow(clippy::too_many_arguments)]
+fn render_marked(
+    channels: &[Channel],
+    snapshot: &Snapshot,
+    camera: &Camera,
+    scroll: f64,
+    dims: (usize, usize),
+    flat: bool,
+    bar: Option<&HostBar>,
+    marks: Option<&crate::activity::marks::TimeMarks>,
+) -> Vec<String> {
     let (visible, hidden) = drawable(channels);
     let notes = status_notes(snapshot, hidden);
     // The 3D view needs one free text row per ridge label, plus header,
     // time ruler and status line.
     if flat || dims.0 < 80 || dims.1 < 20 || visible.len() + 3 > dims.1 {
-        return render_flat(&visible, dims, bar, &snapshot.gpu_apps, &notes);
+        return render_flat(&visible, dims, bar, &snapshot.gpu_apps, &notes, marks);
     }
     let mut canvas = PixelCanvas::new(dims.0, dims.1, SKY_TOP, SKY_HORIZON);
     let (width, height) = canvas.sample_dims();
@@ -1134,6 +1163,12 @@ fn render(
                 tint,
             );
         }
+    }
+    if let (Some(marks), Some(&front)) = (marks, depths.first()) {
+        join::axis(&mut canvas, marks, scroll, dims, |p| {
+            cell(Vec3D::new(slot_x(p), 0.0, front + 1.5))
+        });
+        join::legend(&mut canvas, marks, 1, 1, dims.0 / 2);
     }
     // Name and live value at each ridge's NOW end, drawn over the time ruler so
     // a ridge is never left unnamed. Ridges run front to back, which is bottom
@@ -1221,14 +1256,17 @@ pub struct Options {
     pub hosts: Option<std::path::PathBuf>,
     /// Container and model-server sources, each opt-in by flag.
     pub(crate) extras: sensors::Extras,
+    /// `--record` and `--no-marks`.
+    pub(crate) join: join::Flags,
 }
 
 /// `--probe`: print one snapshot of this machine per line until stdout
 /// closes. This is what a viewer on another machine runs over ssh. There is
 /// no screen here to tell whether anyone is looking, so the costly GPU query
 /// runs on its own, slower, fixed interval and the last cards are repeated.
-pub fn probe(interval: Duration, gpu_interval: Duration) -> std::io::Result<()> {
+pub fn probe(interval: Duration, gpu_interval: Duration, recording: bool) -> std::io::Result<()> {
     use std::io::Write;
+    let mut recorder = recording.then(|| record::Recorder::open(record::default_path()));
     let mut out = std::io::stdout().lock();
     let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
     let (mut cards, mut gpu_at): (Vec<Gpu>, Option<Instant>) = (Vec::new(), None);
@@ -1244,6 +1282,12 @@ pub fn probe(interval: Duration, gpu_interval: Duration) -> std::io::Result<()> 
         } else {
             snapshot.gpus = cards.clone();
             snapshot.gpu_apps = apps.clone();
+        }
+        if let Some(problem) = recorder
+            .as_mut()
+            .and_then(|r| r.fold(&mut snapshot, join::unix_now()))
+        {
+            eprintln!("systemscape: {problem}"); // once per new problem
         }
         // JSON has no NaN: an Option becomes null, but a bare list entry would not parse.
         snapshot.pkg.retain(|t| t.is_finite());
@@ -1413,6 +1457,17 @@ pub fn run(options: Options) -> std::io::Result<()> {
         None => sensors::Extras::default(),
     };
     let feeds = sensors::Feeds::start(&extras, options.demo, on_screen.clone());
+    let mut marks = join::MarkFeed::start(
+        options.join,
+        options.demo,
+        local_name.is_some(),
+        on_screen.clone(),
+    );
+    let mark_waker = marks.as_ref().and_then(join::MarkFeed::waker);
+    let mut recorder = options
+        .join
+        .record
+        .then(|| record::Recorder::open(record::default_path()));
     let sensors = local_name.is_some().then(|| {
         let sensor_sight = on_screen.clone();
         let merger = feeds.merger();
@@ -1428,6 +1483,9 @@ pub fn run(options: Options) -> std::io::Result<()> {
                 }
                 let mut snapshot = poll_sensors(&mut prev_cpu, &mut rates, gpus);
                 merger.merge(&mut snapshot);
+                if let Some(recorder) = &mut recorder {
+                    recorder.fold(&mut snapshot, join::unix_now());
+                }
                 if tx.send(snapshot).is_err() {
                     break;
                 }
@@ -1441,6 +1499,9 @@ pub fn run(options: Options) -> std::io::Result<()> {
             sensors.thread().unpark();
         }
         feeds.wake();
+        if let Some(waker) = &mark_waker {
+            waker.unpark();
+        }
     };
 
     let mut sources: Vec<Source> = Vec::new();
@@ -1487,6 +1548,9 @@ pub fn run(options: Options) -> std::io::Result<()> {
             // A link change redraws the strip, whichever host it is.
             dirty |= changed && (i == selected || federated);
         }
+        if marks.as_mut().is_some_and(join::MarkFeed::drain) {
+            dirty |= local == Some(selected);
+        }
         if slot_started.elapsed().as_secs_f64() >= SLOT_SECS {
             slot_started += Duration::from_secs_f64(SLOT_SECS);
             for channel in sources.iter_mut().flat_map(|s| s.channels.iter_mut()) {
@@ -1524,8 +1588,13 @@ pub fn run(options: Options) -> std::io::Result<()> {
                 selected,
             });
             let shown = &sources[selected];
+            let live_from = join::unix_now() - slot_started.elapsed().as_secs_f64();
+            let shown_marks = marks
+                .as_ref()
+                .filter(|_| local == Some(selected))
+                .and_then(|m| m.marks(live_from, join::unix_now()));
             buffer.present_rows(
-                render(
+                render_marked(
                     &shown.channels,
                     &shown.snapshot,
                     &camera,
@@ -1533,6 +1602,7 @@ pub fn run(options: Options) -> std::io::Result<()> {
                     dims,
                     flat,
                     bar.as_ref(),
+                    shown_marks.as_ref(),
                 ),
                 dims,
             )?;
@@ -1593,6 +1663,11 @@ pub fn run(options: Options) -> std::io::Result<()> {
                     }
                 }
                 KeyCode::Char('f') => flat = !flat,
+                KeyCode::Char('m') => {
+                    if let Some(marks) = &mut marks {
+                        marks.show = !marks.show;
+                    }
+                }
                 _ => {}
             }
         }

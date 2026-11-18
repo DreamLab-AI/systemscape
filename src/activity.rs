@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod city_links;
+mod heat;
+pub(crate) mod marks;
 
 const FRAME_MS: u64 = 55; // ~18 FPS while the tour is flying
 const POLL: Duration = Duration::from_secs(2);
@@ -168,6 +170,7 @@ struct State {
     coverage: bool,
     strip: bool,
     links: city_links::Show,
+    heat: heat::Heat,
 }
 
 impl Default for State {
@@ -188,6 +191,7 @@ impl Default for State {
             coverage: false,
             strip: true,
             links: city_links::Show::default(),
+            heat: heat::Heat::default(),
         }
     }
 }
@@ -599,6 +603,7 @@ fn build_scene(
     selected: usize,
     t: f64,
     now: f64,
+    heat: Option<&heat::Tint>,
 ) -> (Mesh3D, Mesh3D) {
     let mut ground = Mesh3D::new(Vec::new(), Vec::new());
     let mut towers = Mesh3D::new(Vec::new(), Vec::new());
@@ -637,6 +642,14 @@ fn build_scene(
             }
             if tower.session == selected {
                 base = mix(base, (255, 255, 255), 0.14);
+            }
+            if let Some(heat) = heat {
+                base = heat.floor(
+                    &session.records,
+                    scale,
+                    (y, y + height),
+                    tower.session == selected,
+                );
             }
             let roof = (i + 1 == floors.len()).then(|| {
                 // Active towers carry a slow beacon on the roof.
@@ -999,7 +1012,12 @@ fn render_city(
     let radius = fitted * state.dolly;
     let angle = state.yaw + SWAY * (state.t * 0.11).sin();
     let viewport = city_camera(tallest, angle, radius, state.lift, centre);
-    let (ground, mut towers) = build_scene(city, &lay, state.selected, state.t, now);
+    let heat = heat::view(&state.heat, &city.day, now);
+    let tint = match &heat {
+        heat::View::Ready(tint) => Some(tint),
+        _ => None,
+    };
+    let (ground, mut towers) = build_scene(city, &lay, state.selected, state.t, now, tint);
     let scene_rows = scene_bottom - scene_top;
     let (ghost, roads, drawn) =
         city_links::scene(city, links, &lay, scale, tallest, scene_rows, &mut towers);
@@ -1058,6 +1076,9 @@ fn render_city(
         canvas.label(col + 4, row, &lines[0], BRIGHT);
         canvas.label(col + 4, row + 1, &lines[1], Mark::of(newest).hue());
         canvas.label(col + 4, row + 2, &lines[2], MUTED);
+        if let Some(energy) = heat::session_energy(&heat, &session.records) {
+            canvas.label(col + 4, row + 3, &fit(&energy.short(), widest), MUTED);
+        }
         callout = Some((col, row, longest + 4));
     }
 
@@ -1099,6 +1120,7 @@ fn render_city(
         "floors: oldest at ground, newest on top",
         (86, 100, 120),
     );
+    heat::legend(&mut canvas, &heat, 1, columns);
     if state.coverage {
         canvas.label(1, 2, coverage, MUTED);
     } else if lay.hidden > 0 {
@@ -1263,6 +1285,27 @@ fn render_flat(
         ),
         GOLD,
     );
+    if let Some(energy) =
+        heat::session_energy(&heat::view(&state.heat, &city.day, now), &session.records)
+    {
+        // After the separator above, whose text this repeats only to measure it.
+        let from = 1 + format!(
+            "── {}/{} · {} · {} · {} records ──",
+            state.selected + 1,
+            city.sessions.len(),
+            session.agent,
+            short(session.id),
+            session.records.len()
+        )
+        .chars()
+        .count();
+        canvas.label(
+            from as i64,
+            below,
+            &fit(&energy.long(), columns.saturating_sub(from + 1)),
+            MUTED,
+        );
+    }
 
     // Records of the selected session, newest first.
     let chosen_record = record_index(state, session);
@@ -1371,6 +1414,9 @@ fn handle_key(state: &mut State, key: KeyEvent, events: &[Event], in_list: bool)
     }
     if key.modifiers.is_empty() && city_links::toggle(&mut state.links, key.code) {
         return Action::Redraw; // a view toggle, like `h`, leaves the tour flying
+    }
+    if key.modifiers.is_empty() && heat::toggle(&mut state.heat, key.code) {
+        return Action::Redraw;
     }
     if !matches!(
         key.code,
@@ -1535,6 +1581,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
+    state.heat = heat::Heat::new(demo);
     let _terminal = crate::Terminal::enter()?;
     let mut next_poll = Instant::now() + POLL;
     let mut dirty = true;
@@ -1561,6 +1608,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             next_poll = Instant::now() + POLL;
         }
         let now = unix_now();
+        dirty |= visible && state.heat.refresh(now);
         let dims = crate::term_dims();
         let in_list = state.flat || dims.0 < 80 || dims.1 < 20;
         // The tour animates only while the view has the keyboard. Visible but
@@ -1752,7 +1800,7 @@ mod tests {
         let total: f64 = floors.iter().map(|(h, _)| h).sum();
         assert!((total - height_cap(&lay)).abs() < 1e-6);
         assert!(floors.iter().any(|(_, mark)| *mark == Mark::Failure));
-        let (ground, towers) = build_scene(&built, &lay, 0, 0.0, 0.0);
+        let (ground, towers) = build_scene(&built, &lay, 0, 0.0, 0.0, None);
         assert!(ground
             .vertices
             .iter()
@@ -1929,7 +1977,7 @@ mod tests {
         let mut state = State::default();
         let built = city(&events, &mut state);
         let lay = layout(&built, 1.0);
-        let (_, towers) = build_scene(&built, &lay, 0, 0.0, unix_now());
+        let (_, towers) = build_scene(&built, &lay, 0, 0.0, unix_now(), None);
         for eye in [Vec3D::new(0.0, 6.0, 9.0), Vec3D::new(30.0, 20.0, 40.0)] {
             let mut viewport = Viewport::new(
                 Transform3D::look_at_lh(eye, Vec3D::ZERO, Vec3D::NEG_Y),
