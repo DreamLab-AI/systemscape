@@ -14,12 +14,29 @@ explicit file must exist. Without a file there are no rules, no banner and no
 change to either view. [`docs/alerts.example.toml`](../alerts.example.toml)
 documents every field, and a test parses it.
 
-Parsing is strict, in the manner of the hosts file. An unknown field, a field
-that does not belong to the rule's kind, a duplicate name, a channel name that
-could mean two channels (`GPU0`, `CPU`) or a `clear` level on the wrong side of
-the threshold makes the view refuse to start, and the error names the rule and
-the reason. Both views read the whole file and refuse it whole, so one file
-serves both.
+Parsing is strict, in the manner of the hosts file. Problems include:
+
+- an unknown field
+- a field that does not belong to the rule's kind
+- a duplicate name
+- a channel name that could mean two channels (`GPU0`, `CPU`)
+- a `clear` level on the wrong side of the threshold
+- a rule naming a host or a link that this run's hosts file does not have
+
+Both views read the whole file. What a problem does depends on how the file
+was found:
+
+- **`--alerts FILE`** (explicit): the view refuses to start, and the error names
+  the rule and the reason.
+- **The default file** (found at the default path, no `--alerts`): the view
+  starts anyway. It skips each rule that has a problem and keeps the rest. A
+  file that does not parse as TOML at all, or cannot be read, gives no rules.
+  An amber status note in the top row gives the first reason, then the file,
+  for example `ALERTS  rule "gpu1-hot": host "gpu1" is not in the hosts file;
+  skipped from ~/.config/systemscape/alerts.toml`. The note stays until `!` opens the
+  rule list once, and the list keeps showing every reason. So one default file
+  serves both views and every hosts file: a rule for a host this run does not
+  watch is simply skipped.
 
 | `when` | View | Fires | Clears |
 |---|---|---|---|
@@ -29,9 +46,16 @@ serves both.
 | `error-burst` | activity | a session with more than `errors` errors in the last `within` s | that session has had no error for `within` s |
 | `quiet` | activity | no record from any session for `for` s, once a newer record has been seen while the view runs | the next record |
 
-- **Channels** are named as the view labels them: `CPU°`, `GPU0°`, `DISK°`,
-  `PWR`, `LOAD`, `MEM`, `GPU0%`, `VRAM0`, `IO`, `NET`. Case does not matter.
-  Units are those shown: °C, W, %, VRAM in GiB used, IO and NET in MB/s.
+- **Channels** are named as the view labels them, and case does not matter.
+  - The fixed channels are `CPU°`, `GPU0°`, `DISK°`, `PWR`, `LOAD`, `MEM`,
+    `GPU0%`, `VRAM0`, `IO` and `NET`. Their units are those shown: °C, W, %,
+    VRAM in GiB used, IO and NET in MB/s.
+  - Any other name is a named channel, such as `LLM tok`, `LLM busy`, or a
+    container's `<name> cpu` / `<name> mem`. It is kept as written (1 to 32
+    characters) and matched when a ridge of that name appears.
+  - A channel that is absent (not appeared yet, or gone) is a missing reading.
+  - A name shaped like a card channel but not one (`GPU1`, `VRAM01`, `GPU°`) is
+    a problem, not a named channel.
 - **Hysteresis.** `clear` is required and must lie strictly on the safe side of
   the threshold. A value hovering at the threshold therefore fires once, and
   fires again only after it has come back to `clear`. A dip into the band
@@ -39,9 +63,11 @@ serves both.
 - **Hosts.** Without `host`, a telemetry rule is evaluated for every host
   separately, each with its own state. `host` must name a host in the hosts
   file. `link-lost` needs at least one remote `[[host]]` and cannot name this
-  machine. Without a hosts file, any rule naming a host or a link is refused.
+  machine. Without a hosts file, any rule naming a host or a link has a
+  problem (see above: refused with `--alerts`, skipped from the default file).
 - **Missing readings.** A missing reading (a stale or down host, a card not
-  reported yet) neither fires nor clears a rule. A pending hold starts again.
+  reported yet, a named channel not present) neither fires nor clears a rule.
+  A pending hold starts again.
 - **Old history.** Activity rules are measured on record timestamps and bounded
   by `within`, so opening the view on a day of history does not set off
   yesterday's errors. `quiet` arms only once it has seen a record newer than its
@@ -50,8 +76,12 @@ serves both.
 ## When rules are evaluated
 
 - **Telemetry** evaluates once a second from the start, whether or not the view
-  is on screen. Its sensors keep sampling off screen (the GPU at a slower pace),
-  so its rules keep evaluating there. A remote host's readings arrive from its
+  is on screen. Its sensors keep sampling off screen, so its rules keep
+  evaluating there. Off screen the GPU is queried only every 10 s. On the polls
+  in between, the last GPU readings are carried forward for up to 25 s, so a
+  GPU rule's `for` hold keeps running and a firing GPU rule can clear. When
+  nvidia-smi stops answering, the cards read as missing after 25 s rather than
+  holding a stale value. A remote host's readings arrive from its
   probe at the host's own interval. Nothing is drawn off screen, so the banner
   appears when the view is next drawn.
 - **Activity** evaluates once a second, and only while the view is on screen,
@@ -60,6 +90,12 @@ serves both.
   and nothing fires, including `quiet`. On return the view re-reads its records
   first, then evaluates, so something that happened while it was away fires
   then, if it is still within its rule's bounds.
+- When the activity view leaves the screen it unsets `@systemscape_activity`,
+  because a value it is no longer checking would go stale. Its banner and rule
+  states are kept. On return, the first evaluation sets the option again if
+  rules still fire. A status line therefore shows activity alerts only while
+  that view is on screen. `@systemscape_telemetry` is never unset this way,
+  because telemetry keeps evaluating.
 - `--text`, `--json`, `--snapshot` and `--probe` evaluate nothing and refuse
   `--alerts`.
 
@@ -115,8 +151,11 @@ option's value changes, never on every evaluation.
 
 - **Banner.** While any rule fires, the top row reads
   `▲ ALERT  cpu-hot render-box CPU° 91 > 85 · session-failed 1 session · ! rules`,
-  and the view draws in the rows below. With nothing firing, the view is drawn
-  exactly as before.
+  and the view draws in the rows below. The same row carries the amber note on
+  skipped rules. The layout (3D or flat ridges, city or record list, and so
+  what `j` and `k` do) is chosen from the whole pane. A banner coming and going
+  never switches it: only the drawing area loses a row. With nothing firing and
+  no note, the view is drawn exactly as before.
 - **`!`** opens or closes the rule list over the top of either view: each rule's
   state (`● firing` with how long, `◐ pending`, `○ ok`), its condition, its
   notifiers, any held-back count, how many rules belong to the other view, and

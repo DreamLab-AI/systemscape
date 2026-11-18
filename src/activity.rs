@@ -1415,18 +1415,76 @@ fn render(
     demo: bool,
     now: f64,
 ) -> Vec<String> {
+    render_sized(events, coverage, state, dims, dims, demo, now)
+}
+
+/// Whether the view is the record list rather than the city. Decided from
+/// the whole pane, so an alert banner taking a row never flips it (and with
+/// it what `j` and `k` do).
+fn in_list(state: &State, layout: (usize, usize)) -> bool {
+    state.flat || layout.0 < 80 || layout.1 < 20
+}
+
+/// The view drawn at `dims`, laid out for the whole pane `layout`.
+fn render_sized(
+    events: &[Event],
+    coverage: &str,
+    state: &mut State,
+    dims: (usize, usize),
+    layout: (usize, usize),
+    demo: bool,
+    now: f64,
+) -> Vec<String> {
     // A replay hands everything below the history and `now` of its cut-off.
     let (events, now, fixed) = replay::window(events, state, now);
     let mut city = city(&events, state);
     city.fixed = fixed;
     let links = city_links::Links::build(&events, &city, state.links, now);
-    let mut rows = if state.flat || dims.0 < 80 || dims.1 < 20 {
+    let mut rows = if in_list(state, layout) {
         render_flat(&city, &links, coverage, state, dims, demo, now)
     } else {
         render_city(&city, &links, coverage, state, dims, demo, now)
     };
     replay::footer(state, dims, &mut rows);
     rows
+}
+
+/// The animation clock. Frames advance the tour and a replay by the time
+/// since the last frame; a view that was off screen starts again from its
+/// return, so a replay does not leap ahead by the time it was hidden.
+struct FrameClock {
+    last: Instant,
+    shown: bool,
+}
+
+impl FrameClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            last: now,
+            shown: true,
+        }
+    }
+
+    /// Note whether the view is on screen. Returns `Some(visible)` when
+    /// that changed.
+    fn sight(&mut self, visible: bool, now: Instant) -> Option<bool> {
+        if visible == self.shown {
+            return None;
+        }
+        self.shown = visible;
+        if visible {
+            self.last = now;
+        }
+        Some(visible)
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last)
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.last = now;
+    }
 }
 
 fn unix_now() -> f64 {
@@ -1637,13 +1695,17 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let mut drawn = Instant::now();
     let mut sight = crate::Sight::new();
     let mut buffer = crate::FrameBuffer::default();
-    let mut last_frame = Instant::now();
+    let mut frames = FrameClock::new(Instant::now());
     loop {
         if sight.tick() {
             dirty = true;
             next_poll = Instant::now();
         }
         let visible = sight.visible();
+        // Leaving the screen, rules stop: their tmux option must not go stale.
+        if frames.sight(visible, Instant::now()) == Some(false) {
+            alerts.rest();
+        }
         // Off screen, the view neither polls nor draws. The transcripts are
         // append-only logs read from a saved offset, so everything written
         // meanwhile is picked up by the first poll once it is shown again.
@@ -1663,21 +1725,17 @@ pub fn run(args: &[String]) -> io::Result<()> {
         let now = unix_now();
         dirty |= visible && state.heat.refresh(now);
         let dims = crate::term_dims();
-        let (width, height) = alerts.view_dims(dims);
-        let in_list = state.flat || width < 80 || height < 20;
+        let in_list = in_list(&state, dims);
         // The tour animates only while the view has the keyboard. Visible but
         // unfocused, it stays current and redraws twice a second.
         let flying = sight.focused() && state.tour && !in_list;
         let playing = sight.focused() && replay::playing(&state);
-        if visible && last_frame.elapsed() >= Duration::from_millis(FRAME_MS) {
-            let dt = if flying {
-                last_frame.elapsed().as_secs_f64()
-            } else {
-                0.0
-            };
+        let elapsed = frames.elapsed(Instant::now());
+        if visible && elapsed >= Duration::from_millis(FRAME_MS) {
+            let dt = if flying { elapsed.as_secs_f64() } else { 0.0 };
             tour_step(&events, &mut state, dt, now);
-            replay::advance(&mut state, &events, last_frame.elapsed().as_secs_f64());
-            last_frame = Instant::now();
+            replay::advance(&mut state, &events, elapsed.as_secs_f64());
+            frames.tick(Instant::now());
         }
         // A new or resized pane is always drawn once, so it is never blank.
         if buffer.dims != dims
@@ -1685,7 +1743,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 && (dirty || flying || playing || drawn.elapsed() >= Duration::from_millis(500))
         {
             let view = alerts.view_dims(dims);
-            let rows = render(&events, &coverage, &mut state, view, demo, now);
+            let rows = render_sized(&events, &coverage, &mut state, view, dims, demo, now);
             buffer.present_rows(alerts.dress(rows, dims), dims)?;
             dirty = false;
             drawn = Instant::now();
@@ -2181,6 +2239,59 @@ mod tests {
         );
         assert_eq!(tidy_home("/srv/home/dev/x", "/home/dev"), "/srv/home/dev/x");
         assert_eq!(tidy_home("a=/home/dev/b c", "/home/dev"), "a=~/b c");
+    }
+
+    #[test]
+    fn a_banner_row_does_not_switch_the_city_to_the_list() {
+        let events = crate::activity_data::demo_events();
+        let now = unix_now();
+        let mut state = State::default();
+        // 20 rows is a city; the banner leaves 19 to draw it in.
+        assert!(!in_list(&state, (120, 20)));
+        let city = plain(&render_sized(
+            &events,
+            "fixture",
+            &mut state,
+            (120, 19),
+            (120, 20),
+            true,
+            now,
+        ));
+        let mut flat = State {
+            flat: true,
+            ..State::default()
+        };
+        let list = plain(&render(&events, "fixture", &mut flat, (120, 19), true, now));
+        assert_eq!(city.lines().count(), 19);
+        assert_ne!(
+            city, list,
+            "a banner row must not switch the city to the list"
+        );
+        let narrow = plain(&render(
+            &events,
+            "fixture",
+            &mut State::default(),
+            (120, 19),
+            true,
+            now,
+        ));
+        assert_eq!(narrow, list, "a pane of 19 rows is the list");
+    }
+
+    #[test]
+    fn a_view_back_on_screen_animates_from_its_return_not_from_when_it_left() {
+        let start = Instant::now();
+        let mut frames = FrameClock::new(start);
+        let hidden = start + Duration::from_secs(1);
+        assert_eq!(frames.sight(false, hidden), Some(false));
+        assert_eq!(frames.sight(false, hidden + Duration::from_secs(5)), None);
+        let back = start + Duration::from_secs(3600);
+        assert_eq!(frames.sight(true, back), Some(true));
+        assert_eq!(frames.elapsed(back), Duration::ZERO);
+        let next = back + Duration::from_millis(55);
+        assert_eq!(frames.elapsed(next), Duration::from_millis(55));
+        frames.tick(next);
+        assert_eq!(frames.elapsed(next), Duration::ZERO);
     }
 
     #[test]
