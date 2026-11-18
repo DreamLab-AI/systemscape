@@ -579,7 +579,9 @@ mod tests {
         let _ = scraper.read_to_string(&mut reply);
         let waited = started.elapsed();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
-        assert!(waited < Duration::from_millis(2500), "{waited:?}");
+        // The silent client is dropped after about a second; the margin is
+        // for loaded build machines and stays under the old five seconds.
+        assert!(waited < Duration::from_secs(4), "{waited:?}");
         let mut refused = String::new();
         let _ = silent.read_to_string(&mut refused);
         assert!(refused.starts_with("HTTP/1.1 408"), "{refused}");

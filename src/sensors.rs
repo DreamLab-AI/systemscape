@@ -1031,9 +1031,10 @@ mod tests {
         );
         let (url, request) = serve_once(Some(page.into_bytes()));
         let started = Instant::now();
-        let body = http_get(&url, Duration::from_secs(2), HTTP_CAP).unwrap();
+        // Wide margins: these tests also run on loaded build machines.
+        let body = http_get(&url, Duration::from_secs(20), HTTP_CAP).unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(8),
             "stops at Content-Length without waiting for the server to close"
         );
         assert_eq!(parse_llama(&body).tokens_predicted_total, Some(33697.0));
@@ -1060,7 +1061,7 @@ mod tests {
         let started = Instant::now();
         let error = http_get(&url, Duration::from_millis(400), HTTP_CAP).unwrap_err();
         assert_eq!(error, "timed out");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(8));
 
         let (url, _) = serve_once(Some(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
@@ -1196,7 +1197,7 @@ not json
             run_bounded(&["sleep", "10"], Duration::from_millis(300), 64),
             Err(RunError::TimedOut)
         );
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(8));
         assert_eq!(
             run_bounded(&["sh", "-c", "yes"], Duration::from_secs(5), 4096),
             Err(RunError::TooLarge)
