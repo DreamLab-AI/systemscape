@@ -1604,7 +1604,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         // The tour animates only while the view has the keyboard. Visible but
         // unfocused, it stays current and redraws twice a second.
         let flying = sight.focused() && state.tour && !in_list;
-        let playing = replay::playing(&state);
+        let playing = sight.focused() && replay::playing(&state);
         if visible && last_frame.elapsed() >= Duration::from_millis(FRAME_MS) {
             let dt = if flying {
                 last_frame.elapsed().as_secs_f64()

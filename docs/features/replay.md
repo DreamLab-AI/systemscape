@@ -38,7 +38,7 @@ The other keys work as usual: `j`/`k` and `Tab` choose among the sessions that
 existed at the cut-off, `f` and Enter open the detail view, and the camera keys
 steer. Entering replay stops the live tour, so automatic selection never moves
 the selection while you are watching. Leaving puts back the live view as it
-was: following or held, and the day it showed.
+was: following or held, the day it showed and the session selected.
 
 Limits:
 

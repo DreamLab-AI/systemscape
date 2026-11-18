@@ -39,8 +39,20 @@ pub(super) struct Replay {
     /// Recorded seconds per second while playing.
     pub speed: f64,
     pub playing: bool,
-    /// The live view's tour and chosen day, given back on leaving.
-    resume: (bool, Option<String>),
+    /// The live view as it was left, given back on leaving.
+    resume: Resume,
+}
+
+/// What the live view was showing when the replay began. The replay starts
+/// with one session on screen, which takes over the selection, so the user's
+/// own choice is kept here.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Resume {
+    tour: bool,
+    day: Option<String>,
+    key: String,
+    selected: usize,
+    record: Option<String>,
 }
 
 /// Unix milliseconds of a normalised record timestamp.
@@ -204,7 +216,13 @@ fn enter(state: &mut State, events: &[Event]) {
         cutoff: first,
         speed: DEFAULT_SPEED,
         playing: true,
-        resume: (state.tour, state.day.take()),
+        resume: Resume {
+            tour: state.tour,
+            day: state.day.take(),
+            key: state.key.clone(),
+            selected: state.selected,
+            record: state.record.clone(),
+        },
     });
     state.day = Some(day);
     state.tour = false;
@@ -213,7 +231,9 @@ fn enter(state: &mut State, events: &[Event]) {
 /// Back to the live view as it was left.
 fn leave(state: &mut State) {
     if let Some(replay) = state.replay.take() {
-        (state.tour, state.day) = replay.resume;
+        let resume = replay.resume;
+        (state.tour, state.day, state.key) = (resume.tour, resume.day, resume.key);
+        (state.selected, state.record) = (resume.selected, resume.record);
         state.dwell = 0.0;
     }
 }
@@ -415,7 +435,7 @@ fn cast_state(day: &str, cutoff: i64, speed: f64, playing: bool) -> State {
             cutoff,
             speed,
             playing,
-            resume: (false, None),
+            resume: Resume::default(),
         }),
         ..State::default()
     }
@@ -458,9 +478,7 @@ fn recording(
     let dims = (options.width, options.height);
     let draw = |cutoff: i64, playing: bool| {
         let mut state = cast_state(&day, cutoff, speed, playing);
-        let mut rows = render(events, coverage, &mut state, dims, demo, 0.0);
-        footer(&state, dims, &mut rows);
-        rows
+        render(events, coverage, &mut state, dims, demo, 0.0)
     };
     let header = serde_json::json!({
         "version": 2,
@@ -644,6 +662,9 @@ mod tests {
             Action::Ignore
         );
         let mut state = State::default();
+        let live = city(&events, &mut state);
+        select(&mut state, &live, 3);
+        let chosen = state.key.clone();
         press(&mut state, &events, KeyCode::Char('r'));
         let replay = state.replay.clone().unwrap();
         let (first, last) = bounds(&events, &replay.day).unwrap();
@@ -696,6 +717,7 @@ mod tests {
         // Leaving gives back the live view: following, newest day.
         press(&mut state, &events, KeyCode::Char('r'));
         assert!(state.replay.is_none() && state.tour && state.day.is_none());
+        assert_eq!((state.key.as_str(), state.selected), (chosen.as_str(), 3));
         press(&mut state, &events, KeyCode::Char('r'));
         assert_eq!(press(&mut state, &events, KeyCode::Esc), Action::Redraw);
         assert!(
@@ -881,8 +903,7 @@ mod tests {
         let (first, last) = bounds(&events, &day).unwrap();
         let speed = (last - first) as f64 / 1000.0 / 6.0;
         let mut state = cast_state(&day, last, speed, false);
-        let mut direct = render(&events, "fixture", &mut state, (120, 38), true, 0.0);
-        footer(&state, (120, 38), &mut direct);
+        let direct = render(&events, "fixture", &mut state, (120, 38), true, 0.0);
         let screen = play(&lines, 38);
         assert_eq!(screen, direct);
         let text = plain(&screen);
