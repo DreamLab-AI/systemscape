@@ -350,6 +350,7 @@ mod tests {
                         &Camera::default(),
                         0.4,
                         dims,
+                        dims,
                         flat,
                         None,
                         marks,

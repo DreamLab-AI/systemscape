@@ -30,6 +30,37 @@ const POLL: Duration = Duration::from_secs(2);
 /// sensors keep their two-second pace so rates and peaks are not diluted;
 /// nvidia-smi, the costly one, runs a fifth as often.
 const BACKGROUND_GPU_POLL: Duration = Duration::from_secs(10);
+/// How long the last GPU readings stand in for polls that skip the query,
+/// or whose query fails: past this a card reads as silent, not stale.
+const GPU_CARRY: Duration = Duration::from_secs(25);
+
+/// The last good GPU query, repeated on the polls in between, so a channel
+/// (and an alert rule's hold on it) does not lapse off screen.
+#[derive(Default)]
+struct LastCards {
+    cards: Vec<Gpu>,
+    apps: Vec<GpuApp>,
+    at: Option<Instant>,
+}
+
+impl LastCards {
+    /// Keep a fresh query's cards, or fill a poll without cards from the last
+    /// good query while it is younger than [`GPU_CARRY`].
+    fn carry(&mut self, snapshot: &mut Snapshot, queried: bool, now: Instant) {
+        if queried && !snapshot.gpus.is_empty() {
+            self.cards.clone_from(&snapshot.gpus);
+            self.apps.clone_from(&snapshot.gpu_apps);
+            self.at = Some(now);
+        } else if snapshot.gpus.is_empty()
+            && self
+                .at
+                .is_some_and(|at| now.saturating_duration_since(at) <= GPU_CARRY)
+        {
+            snapshot.gpus.clone_from(&self.cards);
+            snapshot.gpu_apps.clone_from(&self.apps);
+        }
+    }
+}
 const SLOT_SECS: f64 = 150.0; // one history slot per 150s
 const HISTORY: usize = 48; // 48 × 150s = 2h end to end
 const RELIEF: f64 = 5.0; // world height of a full-scale value
@@ -1076,10 +1107,14 @@ fn render(
     flat: bool,
     bar: Option<&HostBar>,
 ) -> Vec<String> {
-    render_marked(channels, snapshot, camera, scroll, dims, flat, bar, None)
+    render_marked(
+        channels, snapshot, camera, scroll, dims, dims, flat, bar, None,
+    )
 }
 
 /// The view, with this machine's activity marks on the time axis when given.
+/// It is drawn at `dims`; `layout` is the whole pane, which alone decides
+/// between 3D and flat, so an alert banner taking a row never flips it.
 #[allow(clippy::too_many_arguments)]
 fn render_marked(
     channels: &[Channel],
@@ -1087,6 +1122,7 @@ fn render_marked(
     camera: &Camera,
     scroll: f64,
     dims: (usize, usize),
+    layout: (usize, usize),
     flat: bool,
     bar: Option<&HostBar>,
     marks: Option<&crate::activity::marks::TimeMarks>,
@@ -1095,7 +1131,7 @@ fn render_marked(
     let notes = status_notes(snapshot, hidden);
     // The 3D view needs one free text row per ridge label, plus header,
     // time ruler and status line.
-    if flat || dims.0 < 80 || dims.1 < 20 || visible.len() + 3 > dims.1 {
+    if flat || layout.0 < 80 || layout.1 < 20 || visible.len() + 3 > layout.1 {
         return render_flat(&visible, dims, bar, &snapshot.gpu_apps, &notes, marks);
     }
     let mut canvas = PixelCanvas::new(dims.0, dims.1, SKY_TOP, SKY_HORIZON);
@@ -1488,6 +1524,7 @@ pub fn run(options: Options) -> std::io::Result<()> {
             use std::sync::atomic::Ordering;
             let (mut prev_cpu, mut rates) = ((0u64, 0u64), RateState::default());
             let mut gpu_at: Option<Instant> = None;
+            let mut last_cards = LastCards::default();
             loop {
                 let gpus = sensor_sight.load(Ordering::Relaxed)
                     || gpu_at.is_none_or(|at| at.elapsed() >= BACKGROUND_GPU_POLL);
@@ -1495,6 +1532,7 @@ pub fn run(options: Options) -> std::io::Result<()> {
                     gpu_at = Some(Instant::now());
                 }
                 let mut snapshot = poll_sensors(&mut prev_cpu, &mut rates, gpus);
+                last_cards.carry(&mut snapshot, gpus, Instant::now());
                 merger.merge(&mut snapshot);
                 if let Some(recorder) = &mut recorder {
                     recorder.fold(&mut snapshot, join::unix_now());
@@ -1621,6 +1659,7 @@ pub fn run(options: Options) -> std::io::Result<()> {
                 &camera,
                 scroll,
                 alerts.view_dims(dims),
+                dims,
                 flat,
                 bar.as_ref(),
                 shown_marks.as_ref(),
@@ -1975,6 +2014,74 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn off_screen_gpu_readings_carry_between_queries_so_a_rule_holds_and_fires() {
+        use crate::alerts::{parse, Book, HostReading};
+        let rule = "[[rule]]\nname = \"gpu\"\nwhen = \"channel\"\nchannel = \"GPU0°\"\n\
+                    above = 85\nclear = 80\nfor = 30";
+        let mut book = Book::new(parse(rule).unwrap());
+        let mut channels = channels_for(1);
+        let mut last = LastCards::default();
+        let start = Instant::now();
+        let card = Gpu {
+            temp: Some(90.0),
+            ..Gpu::default()
+        };
+        let mut fired = None;
+        // Off screen: a poll every 2 s, the GPU queried on one poll in five.
+        for poll in 0..30u64 {
+            let at = Duration::from_secs(poll * 2);
+            let queried = poll % 5 == 0;
+            // After 40 s nvidia-smi dies: its queries come back empty.
+            let alive = at < Duration::from_secs(40);
+            let mut snapshot = Snapshot {
+                gpus: if queried && alive {
+                    vec![card]
+                } else {
+                    Vec::new()
+                },
+                ..Snapshot::default()
+            };
+            last.carry(&mut snapshot, queried, start + at);
+            poll_into_channels(&mut channels, &snapshot);
+            let gpu = channels.iter().find(|c| c.label() == "GPU0°").unwrap();
+            if alive {
+                assert_eq!(gpu.now, Some(90.0), "poll {poll} lost the GPU reading");
+            }
+            if at > Duration::from_secs(30) + GPU_CARRY {
+                assert_eq!(gpu.now, None, "a dead query must not hold a value for ever");
+            }
+            let reading = HostReading {
+                name: String::new(),
+                remote_live: None,
+                readings: channels.iter().map(|c| (c.label(), c.now)).collect(),
+            };
+            if !book.telemetry(&[reading], at.as_secs_f64()).is_empty() {
+                fired.get_or_insert(at.as_secs());
+            }
+        }
+        assert_eq!(fired, Some(30), "the 30 s hold runs across skipped queries");
+    }
+
+    #[test]
+    fn the_layout_follows_the_whole_pane_not_the_banner_shortened_one() {
+        let mut channels = channels_for(1);
+        demo_prefill(&mut channels);
+        let snapshot = Snapshot::default();
+        let camera = Camera::default();
+        let draw = |dims, layout, flat| {
+            render_marked(
+                &channels, &snapshot, &camera, 0.3, dims, layout, flat, None, None,
+            )
+        };
+        // 20 rows is enough for 3D; a banner leaves 19 to draw in.
+        let flat = draw((100, 19), (100, 19), true);
+        assert_eq!(draw((100, 19), (100, 19), false), flat);
+        let shortened = draw((100, 19), (100, 20), false);
+        assert_eq!(shortened.len(), 19);
+        assert_ne!(shortened, flat, "a banner row must not switch 3D to flat");
     }
 
     #[test]

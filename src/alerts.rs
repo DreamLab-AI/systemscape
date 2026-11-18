@@ -37,6 +37,7 @@ const MAX_SECONDS: f64 = 7.0 * 86_400.0;
 const EVERY: Duration = Duration::from_secs(1);
 const BANNER_BG: Rgb = (92, 18, 30);
 const BANNER_FG: Rgb = (255, 226, 226);
+const NOTE_BG: Rgb = (74, 54, 8);
 const LIST_BG: Rgb = (16, 21, 32);
 const MUTED: Rgb = (126, 144, 164);
 const RED: Rgb = (255, 95, 95);
@@ -226,21 +227,39 @@ pub(crate) fn default_path() -> Option<PathBuf> {
     crate::hosts::default_path().map(|hosts| hosts.with_file_name("alerts.toml"))
 }
 
-/// Parse and validate a whole rules file, for both views.
+/// Parse and validate a whole rules file, for both views: one wrong rule
+/// refuses the file.
 pub(crate) fn parse(text: &str) -> Result<Vec<Rule>, String> {
+    let (rules, problems) = parse_lenient(text)?;
+    match problems.into_iter().next() {
+        Some(problem) => Err(problem),
+        None => Ok(rules),
+    }
+}
+
+/// Parse a rules file, keeping every valid rule and the reason each other
+/// rule was refused. Only a file that does not parse as rules at all, or
+/// holds none, is an error.
+fn parse_lenient(text: &str) -> Result<(Vec<Rule>, Vec<String>), String> {
     let file: FileConfig = toml::from_str(text).map_err(|e| e.message().to_string())?;
     if file.rules.is_empty() {
         return Err("the file defines no [[rule]]".into());
     }
-    let mut rules: Vec<Rule> = Vec::new();
+    let (mut rules, mut problems): (Vec<Rule>, Vec<String>) = (Vec::new(), Vec::new());
     for entry in file.rules {
-        check_name(&entry.name)?;
-        if rules.iter().any(|r| r.name == entry.name) {
-            return Err(format!("rule name {:?} is used twice", entry.name));
+        let checked = check_name(&entry.name).and_then(|()| {
+            if rules.iter().any(|r| r.name == entry.name) {
+                Err(format!("rule name {:?} is used twice", entry.name))
+            } else {
+                validate(entry)
+            }
+        });
+        match checked {
+            Ok(rule) => rules.push(rule),
+            Err(problem) => problems.push(problem),
         }
-        rules.push(validate(entry)?);
     }
-    Ok(rules)
+    Ok((rules, problems))
 }
 
 /// Rule names reach tmux and terminal parsers: plain characters only.
@@ -261,9 +280,13 @@ fn check_name(name: &str) -> Result<(), String> {
 }
 
 /// Map a channel name to the label the telemetry view shows, or say why not.
-/// Case does not matter; anything that could mean two channels is refused.
+/// Case does not matter. A fixed channel comes back as the view spells it;
+/// any other name is a named channel (a container, a model server) kept as
+/// written and matched when it appears. A name that could mean two fixed
+/// channels is refused.
 pub(crate) fn channel_label(text: &str) -> Result<String, String> {
-    let name = text.trim().to_uppercase();
+    let written = text.trim();
+    let name = written.to_uppercase();
     if ["CPU°", "DISK°", "PWR", "LOAD", "MEM", "IO", "NET"].contains(&name.as_str()) {
         return Ok(name);
     }
@@ -278,6 +301,27 @@ pub(crate) fn channel_label(text: &str) -> Result<String, String> {
     if card("GPU", "°").is_some() || card("GPU", "%").is_some() || card("VRAM", "").is_some() {
         return Ok(name);
     }
+    // Anything shaped like a card channel must be one, or it is a typo.
+    let card_like = ["GPU", "VRAM"].iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|rest| {
+            rest.trim_end_matches(['°', '%'])
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        })
+    });
+    let fixed_like = card_like || ["CPU", "DISK", "NVME"].contains(&name.as_str());
+    if !fixed_like {
+        let plain = !written.is_empty()
+            && written.chars().count() <= 32
+            && !written.chars().any(char::is_control);
+        return if plain {
+            Ok(written.to_string())
+        } else {
+            Err(format!(
+                "channel {written:?} must be 1 to 32 characters, as the view labels it"
+            ))
+        };
+    }
     let why = match name.as_str() {
         "CPU" => "CPU names no channel: CPU° is the temperature, LOAD the utilisation".into(),
         "DISK" | "NVME" => "the disk temperature channel is DISK°".into(),
@@ -289,8 +333,8 @@ pub(crate) fn channel_label(text: &str) -> Result<String, String> {
         _ => match card("GPU", "") {
             Some(n) => format!("GPU{n} could be GPU{n}° (temperature) or GPU{n}% (utilisation)"),
             None => format!(
-                "unknown channel {name:?}; name a channel as the view labels it: \
-                 CPU°, GPU0°, DISK°, PWR, LOAD, MEM, GPU0%, VRAM0, IO or NET"
+                "{name} is not a card channel; cards are numbered 0 to 99 as the view \
+                 shows them, such as GPU0°, GPU0% or VRAM0"
             ),
         },
     };
@@ -435,35 +479,83 @@ fn validate(entry: RuleEntry) -> Result<Rule, String> {
 /// source's name and whether it is remote, `federated` whether a hosts file
 /// is in use.
 fn bind(rules: &[Rule], hosts: &[(String, bool)], federated: bool) -> Result<(), String> {
-    for rule in rules {
-        let at = |e: String| format!("rule {:?}: {e}", rule.name);
-        let (host, link) = match &rule.trigger {
-            Trigger::Channel { host, .. } => (host, false),
-            Trigger::LinkLost { host, .. } => (host, true),
-            _ => continue,
-        };
-        if !federated && (host.is_some() || link) {
-            return Err(at(
-                "names a host or a link, which needs a hosts file with a [[host]]".into(),
-            ));
-        }
-        match host {
-            Some(name) => match hosts.iter().find(|(n, _)| n == name) {
-                None => return Err(at(format!("host {name:?} is not in the hosts file"))),
-                Some((_, false)) if link => {
-                    return Err(at(format!(
-                        "host {name:?} is this machine; only a remote host's link can be lost"
-                    )))
-                }
-                Some(_) => {}
-            },
-            None if link && !hosts.iter().any(|(_, remote)| *remote) => {
-                return Err(at("link-lost needs at least one remote [[host]]".into()))
-            }
-            None => {}
-        }
+    match rules
+        .iter()
+        .find_map(|rule| unbound(rule, hosts, federated))
+    {
+        Some(problem) => Err(problem),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Why a rule cannot apply to these hosts, if it cannot.
+fn unbound(rule: &Rule, hosts: &[(String, bool)], federated: bool) -> Option<String> {
+    let at = |e: &str| Some(format!("rule {:?}: {e}", rule.name));
+    let (host, link) = match &rule.trigger {
+        Trigger::Channel { host, .. } => (host, false),
+        Trigger::LinkLost { host, .. } => (host, true),
+        _ => return None,
+    };
+    if !federated && (host.is_some() || link) {
+        return at("names a host or a link, which needs a hosts file with a [[host]]");
+    }
+    match host {
+        Some(name) => match hosts.iter().find(|(n, _)| n == name) {
+            None => at(&format!("host {name:?} is not in the hosts file")),
+            Some((_, false)) if link => at(&format!(
+                "host {name:?} is this machine; only a remote host's link can be lost"
+            )),
+            Some(_) => None,
+        },
+        None if link && !hosts.iter().any(|(_, remote)| *remote) => {
+            at("link-lost needs at least one remote [[host]]")
+        }
+        None => None,
+    }
+}
+
+/// The rules one view runs, from a rules file's text. An explicit file is
+/// strict: any problem refuses it. The default file is lenient: rules that
+/// are wrong, or cannot apply to these hosts, are skipped and come back as
+/// problems for a status note. Returns this view's rules, how many belong to
+/// the other view, and the problems.
+fn select(text: &str, strict: bool, load: &Load<'_>) -> Result<Selected, String> {
+    let (rules, mut problems) = if strict {
+        (parse(text)?, Vec::new())
+    } else {
+        match parse_lenient(text) {
+            Ok(parsed) => parsed,
+            Err(problem) => (Vec::new(), vec![problem]),
+        }
+    };
+    let (mut mine, others): (Vec<Rule>, Vec<Rule>) = rules
+        .into_iter()
+        .partition(|r| r.trigger.view() == load.view);
+    if load.view == View::Telemetry {
+        if strict {
+            bind(&mine, load.hosts, load.federated)?;
+        }
+        mine.retain(|rule| match unbound(rule, load.hosts, load.federated) {
+            Some(problem) => {
+                problems.push(problem);
+                false
+            }
+            None => true,
+        });
+    }
+    Ok(Selected {
+        mine,
+        others: others.len(),
+        problems,
+    })
+}
+
+/// What [`select`] keeps.
+#[derive(Debug)]
+struct Selected {
+    mine: Vec<Rule>,
+    others: usize,
+    problems: Vec<String>,
 }
 
 // ---------------------------------------------------------------- state machine
@@ -624,7 +716,7 @@ impl Book {
                     } => host
                         .readings
                         .iter()
-                        .find(|(l, _)| l == label)
+                        .find(|(l, _)| l.to_uppercase() == label.to_uppercase())
                         .and_then(|(_, v)| *v)
                         .map(|v| Obs {
                             trip: if *above { v > *level } else { v < *level },
@@ -1090,6 +1182,10 @@ pub(crate) struct Alerts {
     federated: bool,
     demo: bool,
     list: bool,
+    /// Why rules in the default file were skipped. Shown in the banner row
+    /// until the rule list has been opened once, and in the list always.
+    skipped: Vec<String>,
+    skipped_seen: bool,
     clock: Instant,
     evaluated: Option<Instant>,
     /// The book's clock at the last evaluation: seconds since start for
@@ -1151,21 +1247,43 @@ impl Alerts {
             match path {
                 None => (Vec::new(), "no rules file".to_string()),
                 Some(path) => {
-                    let text = std::fs::read_to_string(&path)
-                        .map_err(|e| format!("cannot read alerts file {}: {e}", path.display()))?;
-                    let rules =
-                        parse(&text).map_err(|e| format!("alerts file {}: {e}", path.display()))?;
-                    (rules, format!("rules from {}", path.display()))
+                    let strict = load.explicit.is_some();
+                    let shown = path.display();
+                    let selected = match std::fs::read_to_string(&path) {
+                        Ok(text) => select(&text, strict, &load)
+                            .map_err(|e| format!("alerts file {shown}: {e}"))?,
+                        Err(e) if strict => {
+                            return Err(format!("cannot read alerts file {shown}: {e}"))
+                        }
+                        Err(e) => Selected {
+                            mine: Vec::new(),
+                            others: 0,
+                            problems: vec![format!("cannot read it: {e}")],
+                        },
+                    };
+                    let origin = format!("rules from {shown}");
+                    return Ok(Self::start(load, selected, origin));
                 }
             }
         };
         let (mine, others): (Vec<Rule>, Vec<Rule>) = rules
             .into_iter()
             .partition(|r| r.trigger.view() == load.view);
-        if load.view == View::Telemetry {
-            bind(&mine, load.hosts, load.federated)
-                .map_err(|e| format!("alerts, {origin}: {e}"))?;
-        }
+        let selected = Selected {
+            mine,
+            others: others.len(),
+            problems: Vec::new(),
+        };
+        Ok(Self::start(load, selected, origin))
+    }
+
+    /// Detect tmux (only when there are rules) and build the live alerts.
+    fn start(load: Load<'_>, selected: Selected, origin: String) -> Self {
+        let Selected {
+            mine,
+            others,
+            problems,
+        } = selected;
         let place = if mine.is_empty() {
             Place {
                 pane: None,
@@ -1174,9 +1292,9 @@ impl Alerts {
         } else {
             Place::detect()
         };
-        Ok(Self::with(
+        let mut alerts = Self::with(
             mine,
-            others.len(),
+            others,
             load.view,
             place,
             Box::new(LiveSink),
@@ -1184,7 +1302,9 @@ impl Alerts {
             load.hosts.iter().map(|(n, _)| n.clone()).collect(),
             load.federated,
             load.demo,
-        ))
+        );
+        alerts.skipped = problems;
+        alerts
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1214,6 +1334,8 @@ impl Alerts {
             federated,
             demo,
             list: false,
+            skipped: Vec::new(),
+            skipped_seen: false,
             clock: Instant::now(),
             evaluated: None,
             now: 0.0,
@@ -1284,10 +1406,24 @@ impl Alerts {
     /// The rule-list key.
     pub(crate) fn toggle_list(&mut self) {
         self.list = !self.list;
+        self.skipped_seen = true;
+    }
+
+    /// The view has gone off screen and stops evaluating: unset its tmux
+    /// option, which would otherwise go stale. The next evaluation on screen
+    /// sets it again.
+    pub(crate) fn rest(&mut self) {
+        self.dispatch.sync_option(String::new(), self.sink.as_mut());
     }
 
     fn banner_due(&self, dims: (usize, usize)) -> bool {
-        dims.1 >= 3 && self.book.any_firing()
+        dims.1 >= 3 && (self.book.any_firing() || self.note_due())
+    }
+
+    /// Whether the banner row carries the note on skipped rules: some were
+    /// skipped and the rule list has not been opened since.
+    fn note_due(&self) -> bool {
+        !self.skipped.is_empty() && !self.skipped_seen
     }
 
     /// The size the view should draw at: one row fewer while a banner shows.
@@ -1318,8 +1454,13 @@ impl Alerts {
             }
         }
         if self.banner_due(dims) {
-            let mut canvas = PixelCanvas::new(dims.0, 1, BANNER_BG, BANNER_BG);
-            canvas.label(0, 0, &self.banner_text(), BANNER_FG);
+            let (text, bg) = if self.book.any_firing() {
+                (self.banner_text(), BANNER_BG)
+            } else {
+                (self.note_text(), NOTE_BG)
+            };
+            let mut canvas = PixelCanvas::new(dims.0, 1, bg, bg);
+            canvas.label(0, 0, &text, BANNER_FG);
             rows.insert(0, canvas.rows().remove(0));
         }
         rows
@@ -1366,7 +1507,32 @@ impl Alerts {
             };
             parts.push(format!("{} {detail}", rule.name));
         }
-        format!(" ▲ ALERT  {}  · ! rules", parts.join(" · "))
+        let skipped = match self.skipped.len() {
+            0 => String::new(),
+            n => format!(" · {} skipped", plural(n, "rule")),
+        };
+        format!(" ▲ ALERT  {}{skipped}  · ! rules", parts.join(" · "))
+    }
+
+    /// The status note on rules skipped from the default file.
+    fn note_text(&self) -> String {
+        let more = match self.skipped.len() {
+            0 | 1 => String::new(),
+            n => format!(" (+{} more)", n - 1),
+        };
+        let first = self.skipped.first().map(String::as_str).unwrap_or("");
+        // The reason first, so a narrow pane still shows it.
+        let path = self.origin.trim_start_matches("rules from ");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = match path.strip_prefix(home.as_str()) {
+            Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
+            _ => path.to_string(),
+        };
+        format!(
+            " ALERTS  {}{more}; skipped from {}  · ! rules",
+            clean(first),
+            clean(&path)
+        )
     }
 
     /// The rule list: every rule, its state and its notifiers, then notes.
@@ -1442,6 +1608,9 @@ impl Alerts {
                 ),
                 colour,
             ));
+        }
+        for problem in &self.skipped {
+            lines.push((clean(&format!("skipped: {problem}")), AMBER));
         }
         if self.others > 0 {
             lines.push((
@@ -1824,10 +1993,155 @@ mod tests {
         }
         assert_eq!(channel_label("vram1").unwrap(), "VRAM1");
         for bad in [
-            "CPU", "GPU1", "GPU°", "VRAM", "VRAM01", "GPU123°", "TEMP", "DISK",
+            "CPU", "GPU1", "GPU°", "VRAM", "VRAM01", "GPU123°", "DISK", "",
         ] {
             assert!(channel_label(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn named_channels_are_accepted_as_written_and_absent_ones_read_as_nothing() {
+        for named in ["LLM tok", "LLM busy", "visionflow cpu", "ruvector mem"] {
+            assert_eq!(channel_label(named), Ok(named.to_string()));
+        }
+        let rule = rule(
+            "name = \"tok\"\nwhen = \"channel\"\nchannel = \"LLM tok\"\nabove = 50\nclear = 10",
+        )
+        .unwrap();
+        let mut book = Book::new(vec![rule]);
+        let with = |value: Option<f64>| HostReading {
+            name: String::new(),
+            remote_live: None,
+            readings: match value {
+                Some(v) => vec![("llm tok".into(), Some(v))],
+                None => vec![("MEM".into(), Some(40.0))],
+            },
+        };
+        assert!(
+            book.telemetry(&[with(None)], 0.0).is_empty(),
+            "absent: no reading"
+        );
+        let fired = book.telemetry(&[with(Some(80.0))], 1.0);
+        assert!(
+            fired.len() == 1 && fired[0].fired,
+            "matched without regard to case"
+        );
+        assert!(
+            book.telemetry(&[with(None)], 2.0).is_empty(),
+            "gone: neither fires nor clears"
+        );
+        assert!(book.any_firing());
+    }
+
+    fn telemetry_load(hosts: &[(String, bool)], federated: bool) -> Load<'_> {
+        Load {
+            view: View::Telemetry,
+            explicit: None,
+            demo: false,
+            hosts,
+            federated,
+        }
+    }
+
+    #[test]
+    fn the_default_file_skips_what_cannot_apply_and_an_explicit_one_refuses() {
+        let text = "[[rule]]\nname = \"ok\"\nwhen = \"channel\"\nchannel = \"CPU°\"\n\
+                    above = 85\nclear = 80\n\
+                    [[rule]]\nname = \"typo\"\nwhen = \"channel\"\nchannel = \"GPU1\"\n\
+                    above = 85\nclear = 80\n\
+                    [[rule]]\nname = \"elsewhere\"\nwhen = \"link-lost\"\nfor = 30\n\
+                    [[rule]]\nname = \"quiet\"\nwhen = \"quiet\"\nfor = 60\n";
+        let alone = [(String::new(), false)];
+        let load = telemetry_load(&alone, false);
+        let lenient = select(text, false, &load).unwrap();
+        let names: Vec<&str> = lenient.mine.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["ok"]);
+        assert_eq!(lenient.others, 1);
+        assert_eq!(lenient.problems.len(), 2);
+        assert!(
+            lenient.problems[0].contains("\"typo\"") && lenient.problems[1].contains("hosts file")
+        );
+        assert!(select(text, true, &load).unwrap_err().contains("typo"));
+        // Without the typo the explicit file still refuses the unbound rule.
+        let bound_only = text.replace("channel = \"GPU1\"", "channel = \"GPU1°\"");
+        assert!(select(&bound_only, true, &load)
+            .unwrap_err()
+            .contains("elsewhere"));
+        // A file that is not TOML: no rules, one problem, no refusal.
+        let broken = select("[[rule]\nname =", false, &load).unwrap();
+        assert!(broken.mine.is_empty() && broken.problems.len() == 1);
+        assert!(select("[[rule]\nname =", true, &load).is_err());
+    }
+
+    #[test]
+    fn skipped_rules_show_a_note_until_the_rule_list_is_opened() {
+        let sink = Recorder::default();
+        let mut alerts = alerts(vec![channel_rule("")], View::Telemetry, outside(), &sink);
+        alerts.origin = "rules from /home/u/.config/systemscape/alerts.toml".into();
+        alerts.skipped = vec!["rule \"x\": host \"gpu1\" is not in the hosts file".into()];
+        assert_eq!(alerts.view_dims((80, 24)), (80, 23));
+        let rows = alerts.dress(vec![" ".repeat(80); 23], (80, 24));
+        let text = plain(&rows).join("\n");
+        assert!(text.contains("ALERTS  rule \"x\": host \"gpu1\""), "{text}");
+        alerts.toggle_list();
+        let text = plain(&alerts.dress(vec![" ".repeat(80); 24], (80, 24))).join("\n");
+        assert!(
+            text.contains("skipped: rule \"x\""),
+            "the list keeps the reason: {text}"
+        );
+        alerts.toggle_list();
+        assert_eq!(
+            alerts.view_dims((80, 24)),
+            (80, 24),
+            "seen once, the note goes"
+        );
+    }
+
+    #[test]
+    fn resting_off_screen_unsets_the_tmux_option_until_the_next_evaluation() {
+        let now = 1_800_000_000.0;
+        let sink = Recorder::default();
+        let failed =
+            rule("name = \"failed\"\nwhen = \"session-error\"\nnotify = [\"tmux-option\"]")
+                .unwrap();
+        let mut alerts = alerts(
+            vec![failed],
+            View::Activity,
+            tmux_place(Passthrough::Off),
+            &sink,
+        );
+        let events = [event("x", "failure", 120.0, now)];
+        let changes = alerts.book.activity(&events, now);
+        alerts.deliver(changes, 0.0, true);
+        let option = |args: &[&str]| Call::Tmux(args.iter().map(|s| s.to_string()).collect());
+        let set = option(&[
+            "set-option",
+            "-w",
+            "-t",
+            "%3",
+            "@systemscape_activity",
+            "failed",
+        ]);
+        let unset = option(&[
+            "set-option",
+            "-w",
+            "-u",
+            "-t",
+            "%3",
+            "@systemscape_activity",
+        ]);
+        assert_eq!(sink.take(), vec![set.clone()]);
+        alerts.rest();
+        assert_eq!(sink.take(), vec![unset]);
+        alerts.rest();
+        assert_eq!(sink.take(), vec![], "resting twice runs tmux once");
+        let changes = alerts.book.activity(&events, now + 1.0);
+        alerts.deliver(changes, 1.0, true);
+        assert_eq!(
+            sink.take(),
+            vec![set],
+            "back on screen, still firing: set again"
+        );
     }
 
     #[test]
