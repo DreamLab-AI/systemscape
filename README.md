@@ -45,6 +45,8 @@ systemscape --activity          # local work history, interactive 3D
 systemscape --activity --demo   # synthetic fixture; opens no agent histories
 systemscape --activity --text   # readable day/project/agent/session records
 systemscape --activity --json   # records plus coverage, for other local tools
+systemscape --activity --summary   # one day's digest, see Reports and other tools
+systemscape --activity --cast --demo > day.cast   # a replay as an asciinema recording
 ```
 
 Activity reads Claude Code and Codex session histories, including Claude
@@ -88,6 +90,34 @@ By default the tour follows live work: the camera sways in front of the city
 and every six seconds moves the selection to the next active session, or to
 the next session of any kind when none is active.
 
+**Subagents, shared files and yesterday.** A Claude subagent is its own tower,
+standing beside the session that started it and joined to it by a pink arc
+(`b`); its name reads `parent/child`, and `↳` marks it in the strip. When two
+sessions edited the same file on the day shown, a road joins their towers
+(`c`), red while both are active; at most six are drawn and the key counts the
+rest. A faint outline of the previous recorded day's skyline stands behind
+today's (`g`). See [city links](docs/features/city.md).
+
+**Replay.** `r` replays the day on screen: the city is drawn as it stood at a
+cut-off time and towers grow floor by floor. The header and bottom row say
+`REPLAY`, the cut-off time and the speed, so a replay is not mistaken for live
+work. `--activity --cast` writes the same replay to standard output as an
+asciicast v2 recording. A recording contains record text, which may include
+sensitive prompts and commands: use `--demo` for anything you share. See
+[replay](docs/features/replay.md).
+
+**Heat.** With a recorded telemetry history (`systemscape --record`, see
+[Recorded history](#recorded-history)), `e` tints each floor by how busy the
+machine was when that record was made: the busiest GPU's utilisation, or CPU
+load where there is no GPU reading. Times with no reading stay grey. The
+callout and detail view give the machine's energy over the session's span.
+That figure covers everything running then; power cannot be divided between
+sessions that ran at the same time. See [join](docs/features/join.md).
+
+**Stuck sessions.** A session whose most recent tool calls repeat one command,
+each followed by a failure, three times running is marked `↻` in the strip and
+the detail view. It is a reading of logged records, not proof of a loop.
+
 **The detail view.** Enter or `f` opens it for the selected session; panes
 under 80 columns or 20 rows always use it. The top lists every session of the
 day with its status, age, counts and latest record. Below are the selected
@@ -114,13 +144,21 @@ not proof that an agent is running or that a task succeeded.
 | Left / Right, Up / Down | Turn, raise or lower the camera | |
 | `+` / `-`, `0` | Zoom, reset the camera | |
 | `h` | Show / hide the most-recent strip | |
+| `b` / `c` / `g` | Show / hide delegation arcs, shared-file roads, the ghost skyline | `b` / `c`: the subagent and shared-file lines |
+| `e` | Heat: tint floors by recorded machine load | Machine-wide energy line |
+| `r` | Replay the day shown / back to live | same |
+| Space, `,` / `.`, `<` / `>`, Home / End (replaying) | Play or pause, step one record, slower or faster, first or last record | same |
+| `!` | Open or close the alert rule list | same |
 | `?` | Show / hide source coverage | same |
-| `q`, Escape, Ctrl-C | Quit and restore the terminal | same |
+| `q`, Escape, Ctrl-C | Quit and restore the terminal (Escape first leaves a replay) | same |
 
 Any key other than Space, `h` and `?` holds the tour; Space resumes it.
 
 No model calls, network requests, database or writes to source histories are
-needed. Each transcript is read as an append-only log from a saved offset, so
+needed. Four things step outside that, and each happens only when its flag is
+given: `--llama-metrics` makes an HTTP request, `--metrics` listens on a
+socket, `--record` writes one file, and `--verify-commits` asks git about a
+repository. Each transcript is read as an append-only log from a saved offset, so
 a poll costs only the bytes written since the last one. The collector polls
 every two seconds and discovers files every 30 seconds. It reads at most 1 MiB
 per file and 8 MiB per poll, tracks at most 256 files and keeps the newest
@@ -142,10 +180,12 @@ only changed rows in synchronized terminal updates. Panes up to 512 columns ×
 
 Coverage (`?`) reports pending files, omitted files, malformed input and
 truncated history. One-shot text/JSON output performs one bounded poll, so check
-that coverage before treating it as a complete export. Archives and transcripts
+that coverage before treating it as a complete export; `--summary` keeps
+polling for up to three seconds until no tracked file has unread bytes. Archives and transcripts
 can describe the same work; their counts are not additive measures of completed
 tasks or token spend. Commit receipts report what the transcript recorded and
-are not checked against current git reachability. Excerpts are limited to 240
+are not checked against current git reachability unless `--verify-commits`
+is given. Excerpts are limited to 240
 characters; use the source file for the full record.
 
 ## System telemetry
@@ -180,11 +220,76 @@ Front to back:
 | VRAM*n* | `nvidia-smi` memory used, one ridge per card | 0–card total |
 | IO | `/proc/diskstats`, physical-disk reads + writes | log, 0–5000 MB/s |
 | NET | `/proc/net/dev`, RX + TX excluding loopback | log, 0–1250 MB/s |
+| container CPU and memory | `docker stats`, the busiest containers; only with `--containers`, and only while on screen | 0–100 % |
+| LLM tok, busy, waiting | a llama.cpp server's `/metrics` over plain HTTP; only with `--llama-metrics URL` | own scale |
 
 Cards of one kind are shades of that kind's hue and sit closer together than
 different kinds. The status line additionally reports PCH and NIC (`ixgbe`)
 temperatures. Missing sources degrade gracefully: a ridge with no data does
 not appear, and a host without `nvidia-smi` shows no GPU ridges.
+
+Each VRAM label names the processes using the most memory on that card. A
+process in another PID namespace, as seen from inside a container, shows as
+its PID or not at all. A label pulses and shows `▲` when the channel's value
+rises above its own band over the two-hour window. At most six named ridges
+(containers, model server) are drawn. See [sensors](docs/features/sensors.md).
+
+**Activity marks.** The time axis carries marks for recorded commits (`◆`),
+errors (`✕`) and delegated-agent calls (`↳`) from this machine's agent
+histories, so a spike can be matched to what was recorded then. Labels are
+built from kinds, counts and a project name, never from prompt or command
+text. `m` hides them; `--no-marks` stops the telemetry view reading agent
+histories at all. With a hosts file, marks appear only on this machine.
+
+## Alerts
+
+Rules in a TOML file raise a banner line, and if asked a terminal bell, a
+desktop notification or a tmux message, when a channel stays past a threshold,
+a host link is lost, a session ends on an error, errors come in a burst or
+work goes quiet. `!` lists the rules and their states in either view.
+
+```sh
+cp docs/alerts.example.toml ~/.config/systemscape/alerts.toml   # then edit it
+systemscape --alerts ./rules.toml      # a different file
+```
+
+Notification text is built from rule names and numbers, never from record
+text. Telemetry rules keep evaluating while the view is off screen, as its
+sampling does; activity rules rest with the view. See
+[alerts](docs/features/alerts.md).
+
+## Recorded history
+
+`systemscape --record` (or `--probe --record`) appends each closed 150-second
+slot to `$XDG_STATE_HOME/systemscape/telemetry.jsonl`, else
+`~/.local/state/systemscape/telemetry.jsonl`: the time, power, CPU load, GPU
+temperature and utilisation, and memory. It holds 14 days, is readable only by
+its owner and contains no record text. This is the only file SystemScape
+writes, and only with the flag. The activity view reads it for heat.
+
+## Reports and other tools
+
+```sh
+systemscape --status                    # 3 active · 1 stuck · 71°C 412W
+systemscape --activity --summary        # one day: projects, sessions, stuck sessions, contended files
+systemscape --mcp                       # read-only MCP server on stdio, for agents
+systemscape --metrics 127.0.0.1:9108    # OpenMetrics endpoint, until interrupted
+```
+
+`--status` prints one short line and returns in about a tenth of a second,
+from a single bounded poll, so its counts can be low just after start-up. For
+a tmux status bar:
+
+```sh
+set -g status-right '#(systemscape --status --tmux) %H:%M'
+```
+
+`--mcp` answers questions such as who is editing a file, which files are
+contended and which sessions are stuck. Its results are data from transcripts
+and should be treated by the caller as untrusted text. `--metrics` binds to
+loopback only unless `--metrics-allow-remote` is given. `--verify-commits`, on
+`--summary` and the MCP digest, asks git whether each recorded commit still
+exists. See [insight](docs/features/insight.md).
 
 ## Other machines
 
@@ -273,6 +378,7 @@ cargo build --release
 ./target/release/systemscape --hosts hosts.toml   # this machine plus other hosts
 ./target/release/systemscape --probe  # JSON lines for a viewer on another machine
 ./target/release/systemscape --activity
+./target/release/systemscape --record --containers   # keep a history file, add container ridges
 ```
 
 Requires Linux (`/sys/class/hwmon`, `/proc`) and a truecolour terminal.
@@ -293,6 +399,8 @@ useful for checking the full visual without waiting two hours.
 | `0` | Reset the camera |
 | `f` | Switch between sparklines and 3D |
 | Tab / Shift-Tab, `1`–`9` | Next / previous machine, or machine *n* (with a hosts file) |
+| `m` | Show / hide activity marks on the time axis |
+| `!` | Open or close the alert rule list |
 | `q`, Escape, Ctrl-C | Quit and restore the terminal |
 
 ## tmux integration

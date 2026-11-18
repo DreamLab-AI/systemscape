@@ -266,6 +266,56 @@ fn telemetry_mode(args: &[String]) -> Result<TelemetryMode, String> {
 /// Modes other than telemetry: the first flag present on the command line
 /// picks the mode, which then parses the whole command line itself. A new
 /// mode is one line here.
+/// `--help`, after the version line.
+const HELP: &str = "\
+Usage: systemscape [--demo | --hosts FILE] [--alerts FILE] [--record] [--no-marks]
+                   [--containers] [--llama-metrics URL]
+       systemscape --probe [--interval SECS] [--gpu-interval SECS] [--record]
+       systemscape --activity [--demo] [--alerts FILE] [--text|--json|--snapshot]
+                              [--home PATH] [--workspace PATH] [--archive PATH]
+       systemscape --activity --summary [--day YYYY-MM-DD] [--json] [--verify-commits]
+       systemscape --activity --cast [--day YYYY-MM-DD] [--size WxH] [--length SECS]
+       systemscape --status [--tmux] [--gpu] [--no-sensors]
+       systemscape --mcp [--verify-commits]
+       systemscape --metrics ADDR [--metrics-allow-remote] [--gpu]
+
+Telemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.
+           Space holds/resumes flight, arrows steer, +/- zoom, 0 reset, f flat view, q quits.
+           m shows or hides activity marks on the time axis (commits, errors, agent calls).
+           A label pulses with a triangle when its value rises above its own 2 h band.
+           With a hosts file, other machines appear too: Tab or 1-9 picks the host shown.
+Activity: a city of recorded work. District = project, tower = session, floor = action.
+          Space follows live work or holds, j/k session, Enter or f detail view (j/k record,
+          Enter source), [/] day, arrows steer, +/- zoom, 0 reset, h strip, ? sources, q quits.
+          b delegation arcs, c shared-file roads, g yesterday's skyline, e heat from a
+          recorded history. r replays the day: Space play/pause, ,/. record, </> speed,
+          Home/End, Esc or r back to live.
+Both views: ! lists alert rules. They pause while their tmux window is not on screen, and
+slow down while visible but unfocused.
+
+  --demo     synthetic fixture; activity demo never opens agent histories
+  --hosts    hosts file to watch (default $XDG_CONFIG_HOME/systemscape/hosts.toml, if present)
+  --alerts   alert rules file (default $XDG_CONFIG_HOME/systemscape/alerts.toml, if present)
+  --record   append this machine's 150 s slots to $XDG_STATE_HOME/systemscape/telemetry.jsonl
+             (the only file SystemScape writes; 14 days kept)
+  --no-marks telemetry: do not read agent histories for time-axis marks
+  --containers  ridges for the busiest containers' CPU and memory (docker stats; on screen only)
+  --llama-metrics URL  a llama.cpp server's /metrics over plain http:// (a network request)
+  --probe    print this machine's readings as JSON lines, for a viewer elsewhere
+  --interval / --gpu-interval  probe sensor and nvidia-smi periods (default 2 and 10 s)
+  --text     bounded activity tree, also the default when stdout is redirected
+  --json     bounded activity records and coverage
+  --snapshot one 120x38 ANSI activity frame (requires a terminal)
+  --summary  one day's digest: projects, sessions, stuck sessions, contended files
+  --cast     asciicast v2 recording of a replay of one day, to stdout
+             (record text included; use --demo for anything shared)
+  --status   one short line for a tmux status bar or prompt (--tmux adds colour)
+  --mcp      read-only MCP server on stdio for agents
+  --metrics  OpenMetrics endpoint at ADDR (loopback unless --metrics-allow-remote)
+  --verify-commits  ask git whether each recorded commit exists (opens repositories)
+  --help     show this help
+  --version  print version";
+
 type Mode = fn(&[String]) -> std::io::Result<()>;
 const MODES: &[(&str, Mode)] = &[
     // Insight outputs come before `--activity`, which they also accept.
@@ -280,7 +330,7 @@ const MODES: &[(&str, Mode)] = &[
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("systemscape {}\n\nUsage: systemscape [--demo | --hosts FILE]\n       systemscape --probe [--interval SECS] [--gpu-interval SECS]\n       systemscape --activity [--demo] [--text|--json|--snapshot]\n                              [--home PATH] [--workspace PATH] [--archive PATH]\n\nTelemetry: one labelled 3D ridge per channel, GPUs split per card; older left, now right.\n           Space holds/resumes flight, arrows steer, +/- zoom, 0 reset, f flat view, q quits.\n           With a hosts file, other machines appear too: Tab or 1-9 picks the host shown.\nActivity: a city of recorded work. District = project, tower = session, floor = action.\n          Space follows live work or holds, j/k session, Enter or f detail view (j/k record,\n          Enter source), [/] day, arrows steer, +/- zoom, 0 reset, h strip, ? sources, q quits.\nBoth views pause while their tmux window is not on screen, and slow down while visible but unfocused.\n\n  --demo     synthetic fixture; activity demo never opens agent histories\n  --hosts    hosts file to watch (default $XDG_CONFIG_HOME/systemscape/hosts.toml, if present)\n  --probe    print this machine's readings as JSON lines, for a viewer elsewhere\n  --interval / --gpu-interval  probe sensor and nvidia-smi periods (default 2 and 10 s)\n  --text     bounded activity tree, also the default when stdout is redirected\n  --json     bounded activity records and coverage\n  --snapshot one 120x38 ANSI activity frame (requires a terminal)\n  --help     show this help\n  --version  print version", env!("CARGO_PKG_VERSION"));
+        println!("systemscape {}\n\n{}", env!("CARGO_PKG_VERSION"), HELP);
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
